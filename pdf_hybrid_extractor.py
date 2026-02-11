@@ -41,8 +41,8 @@ try:
 except ImportError:
     HAS_PDF2IMAGE = False
 
-# Vision AI
-import google.generativeai as genai
+# Vision AI (nova SDK google-genai)
+from google import genai
 
 # Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -62,11 +62,10 @@ Formate de forma clara e organizada. Se for uma imagem de exame (ultrassom, raio
 
 
 def setup_gemini():
-    """Configura API do Gemini"""
+    """Configura cliente do Gemini (nova SDK)"""
     if not GOOGLE_API_KEY:
         raise ValueError("GOOGLE_API_KEY ou GEMINI_API_KEY não configurada")
-    genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel(VISION_MODEL)
+    return genai.Client(api_key=GOOGLE_API_KEY)
 
 
 def download_file(url: str) -> bytes:
@@ -133,19 +132,18 @@ def extract_text_pdf2image(pdf_bytes: bytes) -> list[dict]:
         os.unlink(temp_path)
 
 
-def analyze_image_with_vision(model, image_bytes: bytes, page_num: int) -> str:
-    """Envia imagem para Gemini Vision"""
+def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str:
+    """Envia imagem para Gemini Vision (nova SDK)"""
     try:
-        # Cria objeto de imagem para Gemini
-        image_part = {
-            "mime_type": "image/png",
-            "data": base64.b64encode(image_bytes).decode()
-        }
+        from google.genai import types
         
-        response = model.generate_content([
-            VISION_PROMPT,
-            {"inline_data": image_part}
-        ])
+        # Cria Part de imagem para nova SDK
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+        
+        response = client.models.generate_content(
+            model=VISION_MODEL,
+            contents=[VISION_PROMPT, image_part]
+        )
         
         return response.text
     except Exception as e:
@@ -187,8 +185,8 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     else:
         raise RuntimeError("Instale PyMuPDF (fitz) ou pdf2image para processar PDFs")
     
-    # Configura Vision AI
-    model = setup_gemini()
+    # Configura cliente Gemini
+    client = setup_gemini()
     
     # Processa cada página
     results = []
@@ -200,7 +198,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         
         if len(text) < MIN_TEXT_THRESHOLD:
             # Página com pouco texto - usa Vision AI
-            vision_text = analyze_image_with_vision(model, page["image_bytes"], page_num)
+            vision_text = analyze_image_with_vision(client, page["image_bytes"], page_num)
             results.append(f"--- Página {page_num} (Vision AI) ---\n{vision_text}")
             pages_with_vision += 1
         else:
