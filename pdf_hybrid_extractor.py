@@ -18,8 +18,12 @@ import io
 import base64
 import tempfile
 import argparse
+import logging
 import requests
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 # Opcional: Flask para modo servidor
 try:
@@ -48,6 +52,8 @@ from google import genai
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN", "XgsXBgexu5HARNDWgtb954QisyNJkB6gvx5PWrGgs7icw3tW")
 MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página
+MAX_VISION_PAGES = 15  # máximo de páginas processadas via Vision AI
+GEMINI_TIMEOUT = 60  # segundos por chamada ao Gemini
 VISION_MODEL = "gemini-2.0-flash"
 VISION_PROMPT = """Analise esta imagem de um documento médico/exame e extraia TODAS as informações textuais visíveis.
 Inclua:
@@ -62,10 +68,13 @@ Formate de forma clara e organizada. Se for uma imagem de exame (ultrassom, raio
 
 
 def setup_gemini():
-    """Configura cliente do Gemini (nova SDK)"""
+    """Configura cliente do Gemini (nova SDK) com timeout"""
     if not GOOGLE_API_KEY:
         raise ValueError("GOOGLE_API_KEY ou GEMINI_API_KEY não configurada")
-    return genai.Client(api_key=GOOGLE_API_KEY)
+    return genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options={"timeout": GEMINI_TIMEOUT * 1000}  # ms
+    )
 
 
 def download_file(url: str) -> bytes:
@@ -76,24 +85,28 @@ def download_file(url: str) -> bytes:
 
 
 def extract_text_pymupdf(pdf_bytes: bytes) -> list[dict]:
-    """Extrai texto página por página usando PyMuPDF"""
+    """Extrai texto página por página usando PyMuPDF.
+    Imagens são renderizadas sob demanda (lazy) para economizar memória."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
-    
+
     for i, page in enumerate(doc):
         text = page.get_text().strip()
-        
-        # Converte página para imagem se precisar
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom para qualidade
-        img_bytes = pix.tobytes("png")
-        
+        needs_vision = len(text) < MIN_TEXT_THRESHOLD
+
+        img_bytes = None
+        if needs_vision:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom para qualidade
+            img_bytes = pix.tobytes("png")
+
         pages.append({
             "page_num": i + 1,
             "text": text,
             "text_length": len(text),
+            "needs_vision": needs_vision,
             "image_bytes": img_bytes
         })
-    
+
     doc.close()
     return pages
 
@@ -185,32 +198,43 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     else:
         raise RuntimeError("Instale PyMuPDF (fitz) ou pdf2image para processar PDFs")
     
-    # Configura cliente Gemini
-    client = setup_gemini()
-    
+    # Conta quantas páginas precisam de vision
+    vision_needed = sum(1 for p in pages if p.get("needs_vision"))
+    logger.info(f"PDF: {len(pages)} páginas, {vision_needed} precisam de Vision AI")
+
+    # Configura cliente Gemini apenas se necessário
+    client = setup_gemini() if vision_needed > 0 else None
+
     # Processa cada página
     results = []
     pages_with_vision = 0
-    
+    pages_skipped_vision = 0
+
     for page in pages:
         page_num = page["page_num"]
         text = page["text"]
-        
-        if len(text) < MIN_TEXT_THRESHOLD:
-            # Página com pouco texto - usa Vision AI
-            vision_text = analyze_image_with_vision(client, page["image_bytes"], page_num)
-            results.append(f"--- Página {page_num} (Vision AI) ---\n{vision_text}")
-            pages_with_vision += 1
+
+        if page.get("needs_vision") and page["image_bytes"]:
+            if pages_with_vision >= MAX_VISION_PAGES:
+                results.append(f"--- Página {page_num} (Vision AI ignorada - limite de {MAX_VISION_PAGES} atingido) ---\n{text}")
+                pages_skipped_vision += 1
+            else:
+                logger.info(f"Vision AI: processando página {page_num}/{len(pages)}")
+                vision_text = analyze_image_with_vision(client, page["image_bytes"], page_num)
+                results.append(f"--- Página {page_num} (Vision AI) ---\n{vision_text}")
+                pages_with_vision += 1
         else:
-            # Página com texto suficiente
             results.append(f"--- Página {page_num} ---\n{text}")
-    
+
     combined_text = "\n\n".join(results)
-    
+
+    logger.info(f"Concluído: {pages_with_vision} vision, {pages_skipped_vision} ignoradas")
+
     return {
         "success": True,
         "total_pages": len(pages),
         "pages_with_vision": pages_with_vision,
+        "pages_skipped_vision": pages_skipped_vision,
         "text": combined_text,
         "minio_path": minio_path
     }
