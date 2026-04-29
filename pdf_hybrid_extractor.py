@@ -22,6 +22,7 @@ import socket
 import argparse
 import ipaddress
 import logging
+import threading
 import requests
 from pathlib import Path
 from urllib.parse import urlparse
@@ -276,7 +277,22 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     if save_to_minio and telefone and minio_config:
         minio_path = save_to_minio_storage(pdf_bytes, telefone, minio_config)
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # Abertura defensiva: PDFs inválidos/criptografados viram ValueError → 400
+    # com mensagem útil em vez do "internal error" genérico do handler de 500.
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"PDF inválido ou corrompido: {e}") from e
+
+    if doc.is_encrypted and not doc.authenticate(""):
+        doc.close()
+        raise ValueError("PDF está criptografado/protegido por senha")
+
+    # Lock pra render do PyMuPDF: MuPDF NÃO é thread-safe num mesmo Document.
+    # Render é rápido (~50-200ms); a chamada Gemini lenta (5-30s) continua
+    # paralela. Sem isso há risco de pixmap corrompido / segfault sob carga.
+    doc_lock = threading.Lock()
+
     try:
         # Passada 1: classifica cada página em native | vision | hybrid (sem renderizar)
         page_metas = []
@@ -320,8 +336,9 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
 
             def _vision_one(meta):
                 pn = meta["page_num"]
-                pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_bytes = pix.tobytes("png")
+                with doc_lock:
+                    pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_bytes = pix.tobytes("png")
                 return pn, analyze_image_with_vision(client, img_bytes, pn)
 
             with ThreadPoolExecutor(max_workers=VISION_PARALLEL) as ex:
@@ -503,7 +520,12 @@ def create_app():
                     return jsonify({"error": "'url' deve começar com http:// ou https://"}), 400
                 pdf_source = download_file(url)
             elif "base64" in data:
-                pdf_source = base64.b64decode(data["base64"])
+                # validate=True: rejeita lixo cedo. binascii.Error herda de
+                # ValueError, então cai no handler de 400 abaixo.
+                try:
+                    pdf_source = base64.b64decode(data["base64"], validate=True)
+                except Exception as e:
+                    raise ValueError(f"base64 inválido: {e}") from e
             else:
                 return jsonify({"error": "Forneça 'url' ou 'base64'"}), 400
 
