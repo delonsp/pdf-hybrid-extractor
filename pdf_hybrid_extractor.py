@@ -54,7 +54,10 @@ API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN", "XgsXBgexu5HARNDWgtb954QisyNJkB6gvx
 MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página
 MAX_VISION_PAGES = 15  # máximo de páginas processadas via Vision AI
 GEMINI_TIMEOUT = 60  # segundos por chamada ao Gemini
-VISION_MODEL = "gemini-2.0-flash"
+# Tenta na ordem: o "latest" auto-bumpa pra versão mais nova quando o Google
+# promove; se falhar (quota zerada, deprecação, etc), cai pro 2.5-flash estável.
+# Sem precisar de deploy quando o Google muda algo.
+VISION_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
 VISION_PROMPT = """Analise esta imagem de um documento médico/exame e extraia TODAS as informações textuais visíveis.
 Inclua:
 - Dados do paciente (nome, idade, data)
@@ -146,21 +149,22 @@ def extract_text_pdf2image(pdf_bytes: bytes) -> list[dict]:
 
 
 def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str:
-    """Envia imagem para Gemini Vision (nova SDK)"""
-    try:
-        from google.genai import types
-        
-        # Cria Part de imagem para nova SDK
-        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-        
-        response = client.models.generate_content(
-            model=VISION_MODEL,
-            contents=[VISION_PROMPT, image_part]
-        )
-        
-        return response.text
-    except Exception as e:
-        return f"[Erro ao analisar página {page_num}: {str(e)}]"
+    """Envia imagem para Gemini Vision (nova SDK), com fallback entre modelos."""
+    from google.genai import types
+
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    last_err = None
+    for model in VISION_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[VISION_PROMPT, image_part]
+            )
+            return response.text
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Vision {model} falhou na página {page_num}: {e}; tentando próximo")
+    return f"[Erro ao analisar página {page_num}: {last_err}]"
 
 
 def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False, 
