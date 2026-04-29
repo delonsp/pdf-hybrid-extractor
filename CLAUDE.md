@@ -23,9 +23,15 @@ gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 4 --worker-class gthread --ti
 
 # Docker
 docker build -t pdf-hybrid-extractor . && docker run -p 5050:5050 -e GEMINI_API_KEY=... -e PDF_EXTRACTOR_TOKEN=... pdf-hybrid-extractor
+
+# Tests
+pip install -r requirements-dev.txt
+pytest                          # 70 tests, ~0.3s
+pytest tests/test_vision.py -v  # single file
+pytest -k "encrypted or ssrf"   # by name pattern
 ```
 
-No test suite, linter, or formatter is configured.
+Tests live in `tests/` (pytest + pytest-mock). Gemini and `requests.get` are mocked — suite runs fully offline. PDFs are synthesized in-memory via `fitz`. No linter/formatter configured.
 
 ## Required env vars
 
