@@ -32,17 +32,25 @@ No test suite, linter, or formatter is configured.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — Gemini Vision
 - `PDF_EXTRACTOR_TOKEN` — bearer token for `/extract`. **Required**; `create_app()` raises if missing. No default — service won't start without it.
 - Optional Minio: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_SECURE`, `MINIO_BUCKET`
-- Optional tuning: `VISION_MODEL` (default `gemini-flash-latest`), `VISION_MODEL_FALLBACK` (default `gemini-2.5-flash`), `MAX_DOWNLOAD_BYTES` (default 50 MB), `RATE_LIMIT_DEFAULT` (default `60 per minute`), `RATE_LIMIT_EXTRACT` (default `30 per minute`)
+- Optional tuning: `VISION_MODEL` (default `gemini-flash-latest`), `VISION_MODEL_FALLBACK` (default `gemini-2.5-flash`), `MAX_DOWNLOAD_BYTES` (default 50 MB), `IMAGE_COVERAGE_THRESHOLD` (default 0.20), `RATE_LIMIT_DEFAULT` (default `60 per minute`), `RATE_LIMIT_EXTRACT` (default `30 per minute`)
 
 ## Architecture
 
 Pipeline in `process_pdf()`:
 
 1. **Open document** — `fitz.open(stream=pdf_bytes, filetype="pdf")` (kept open for the whole pipeline so rendering can be lazy).
-2. **Pass 1: text extraction** — for each page, `page.get_text()`. If `len(text) < MIN_TEXT_THRESHOLD` (50 chars), the page is marked for Vision. **No rendering happens here** — only metadata is collected.
-3. **Pass 2: Vision (parallel + lazy render)** — pages flagged for Vision are capped at `MAX_VISION_PAGES`; the cap'd subset is sent through a `ThreadPoolExecutor(max_workers=VISION_PARALLEL)`. Each worker renders its page (2x zoom PNG) only when picked up, calls `analyze_image_with_vision`, and the bytes go out of scope on return. Pages over the cap stay with their native text and are tagged "ignorada".
-4. **Failure handling** — `analyze_image_with_vision` returns `None` on exception OR empty/blocked response (safety filter). Failed pages fall back to native text and are listed in `failed_pages` in the response.
-5. **Combine** — page outputs joined with `--- Página N ---`, `--- Página N (Vision AI) ---`, `--- Página N (Vision AI falhou ...) ---`, or `--- Página N (Vision AI ignorada ...) ---` markers.
+2. **Pass 1: classify each page into one of 3 modes** (no rendering yet):
+   - **`native`** — `len(text) >= MIN_TEXT_THRESHOLD` (50 chars) AND image area < `IMAGE_COVERAGE_THRESHOLD` (20% of page). Native text only.
+   - **`vision`** — `len(text) < MIN_TEXT_THRESHOLD`. Pure scan / image page; native text useless.
+   - **`hybrid`** — text >= threshold AND image >= 20% of page. Covers medical reports with textual header + embedded ultrasound/x-ray. Without `hybrid`, those pages were native-only and the image content was silently lost.
+   Image coverage computed by `_page_image_coverage(page)` via `page.get_image_info()` (PyMuPDF >= 1.20) — sums bbox areas of raster images, divided by page area. Cheap (no pixel extraction).
+3. **Pass 2: Vision (parallel + lazy render)** — `vision` and `hybrid` pages enter the queue, capped at `MAX_VISION_PAGES`. The cap'd subset goes through `ThreadPoolExecutor(max_workers=VISION_PARALLEL)`. Each worker renders its page (2x zoom PNG) only when picked up, calls `analyze_image_with_vision`, and bytes go out of scope on return. Pages over the cap stay with their native text and are tagged "ignorada".
+4. **Failure handling** — `analyze_image_with_vision` returns `None` on exception OR empty/blocked response (safety filter). Failed pages fall back to native text (when `hybrid`/has any) and land in `failed_pages` in the response.
+5. **Combine** — page outputs joined with markers depending on mode and outcome:
+   - `--- Página N ---` (native)
+   - `--- Página N (Vision AI) ---` (vision-only success)
+   - `--- Página N (texto + Vision AI) ---` (hybrid success — text + Vision concatenated)
+   - `--- Página N (Vision AI falhou ...) ---` / `(imagem ignorada - cap atingido ...)` for failures or cap.
 
 Vision model: `gemini-2.5-flash` (set at `VISION_MODEL`). When changing models, sanity-check the SDK still accepts `types.Part.from_bytes(..., mime_type="image/png")` and that `response.text` shape is unchanged — newer models sometimes shift candidate handling.
 
@@ -52,7 +60,7 @@ Optional: original PDF persisted to Minio at `<bucket>/<telefone>/<timestamp>.pd
 
 ### Key constants (top of file)
 
-`MIN_TEXT_THRESHOLD`, `MAX_VISION_PAGES` (15), `GEMINI_TIMEOUT` (60s, passed as ms to the SDK's `http_options`), `VISION_PARALLEL` (3), `VISION_MODEL`, `VISION_PROMPT`, `TELEFONE_RE`. Tune these before adding new knobs.
+`MIN_TEXT_THRESHOLD` (50), `IMAGE_COVERAGE_THRESHOLD` (0.20 — ratio of page area covered by raster images to trigger hybrid mode), `MAX_VISION_PAGES` (15), `GEMINI_TIMEOUT` (60s, passed as ms to the SDK's `http_options`), `VISION_PARALLEL` (3), `VISION_MODEL`, `VISION_PROMPT`, `TELEFONE_RE`. Tune these before adding new knobs.
 
 ### Gunicorn config rationale
 
@@ -87,6 +95,6 @@ Uses the new `google-genai` SDK (`from google import genai`), not the deprecated
 - `telefone` (optional): digits only, 8-20
 - `save_to_minio` (optional): bool
 
-Response: `{success, type, total_pages, pages_with_vision, pages_skipped_vision, failed_pages, text, minio_path}`. `failed_pages` is a list of page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback).
+Response: `{success, type, total_pages, pages_with_vision, pages_hybrid, pages_skipped_vision, failed_pages, text, minio_path}`. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).
 
 `GET /health` is unauthenticated.

@@ -65,7 +65,12 @@ from google import genai
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN")
 TELEFONE_RE = re.compile(r"^\d{8,20}$")
-MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página
+MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página pra evitar Vision
+# Cobertura mínima de imagem (área de imagens / área da página) pra ativar modo
+# híbrido (texto nativo + Vision). Cobre laudos com header textual + ultrassom
+# embutido — antes essas páginas tinham >50 chars de texto e a imagem era
+# ignorada silenciosamente.
+IMAGE_COVERAGE_THRESHOLD = float(os.getenv("IMAGE_COVERAGE_THRESHOLD", "0.20"))
 MAX_VISION_PAGES = 15  # máximo de páginas processadas via Vision AI
 GEMINI_TIMEOUT = 60  # segundos por chamada ao Gemini
 VISION_PARALLEL = 3  # chamadas Vision paralelas por request (gthread compatível)
@@ -210,17 +215,50 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str 
     return None
 
 
+def _page_image_coverage(page) -> float:
+    """Fração da área da página coberta por imagens raster embutidas.
+
+    Usado pra detectar páginas "híbridas": texto nativo + imagem grande
+    (ex: laudo médico com cabeçalho textual + ultrassom). Threshold-só-de-
+    chars classificava essas como native_only, perdendo o conteúdo da
+    imagem silenciosamente."""
+    try:
+        page_area = abs(page.rect.get_area())
+    except Exception:
+        return 0.0
+    if not page_area:
+        return 0.0
+    try:
+        infos = page.get_image_info()  # PyMuPDF >= 1.20
+    except Exception:
+        return 0.0
+    total = 0.0
+    for info in infos:
+        bbox = info.get("bbox")
+        if not bbox:
+            continue
+        try:
+            total += abs(fitz.Rect(bbox).get_area())
+        except Exception:
+            continue
+    return min(total / page_area, 1.0)
+
+
 def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                 telefone: str = None, minio_config: dict = None) -> dict:
     """
-    Processa PDF com extração híbrida.
+    Processa PDF com extração híbrida em 3 modos por página:
+    - "native":  só texto via PyMuPDF (texto suficiente E sem imagem grande)
+    - "vision":  só Vision (sem texto nativo útil)
+    - "hybrid":  texto + Vision (texto suficiente MAS imagem cobre
+                 IMAGE_COVERAGE_THRESHOLD da página — ex: laudo com header
+                 textual + ultrassom embutido; sem o modo híbrido a imagem
+                 ficava silenciosa)
 
-    - Texto nativo via PyMuPDF.
-    - Páginas com <MIN_TEXT_THRESHOLD chars são renderizadas (lazy) e enviadas
-      ao Gemini Vision em paralelo (até VISION_PARALLEL simultâneas, até
-      MAX_VISION_PAGES no total).
-    - Falha do Vision em página individual não derruba a request: a página
-      vai pra `failed_pages` e o texto nativo é usado como fallback.
+    Pages "vision" e "hybrid" entram na fila de Vision (lazy render +
+    paralelo, até VISION_PARALLEL simultâneas e MAX_VISION_PAGES no total).
+    Falha do Vision em página individual cai pro texto nativo (se houver)
+    e a página entra em `failed_pages`.
     """
     if not HAS_PYMUPDF:
         raise RuntimeError("PyMuPDF (fitz) é obrigatório para processar PDFs")
@@ -240,24 +278,39 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        # Passada 1: extrai texto e marca páginas que precisam de Vision (sem renderizar ainda)
+        # Passada 1: classifica cada página em native | vision | hybrid (sem renderizar)
         page_metas = []
         for i, page in enumerate(doc):
             text = page.get_text().strip()
+            has_text = len(text) >= MIN_TEXT_THRESHOLD
+            img_coverage = _page_image_coverage(page)
+            has_significant_image = img_coverage >= IMAGE_COVERAGE_THRESHOLD
+
+            if not has_text:
+                mode = "vision"
+            elif has_significant_image:
+                mode = "hybrid"
+            else:
+                mode = "native"
+
             page_metas.append({
                 "page_num": i + 1,
                 "text": text,
-                "needs_vision": len(text) < MIN_TEXT_THRESHOLD,
+                "mode": mode,
+                "img_coverage": round(img_coverage, 3),
             })
 
-        # Cap em MAX_VISION_PAGES; o resto é "skipped"
-        to_vision = [m for m in page_metas if m["needs_vision"]]
+        # Cap em MAX_VISION_PAGES; resto vira "skipped"
+        to_vision = [m for m in page_metas if m["mode"] != "native"]
         to_vision_capped = to_vision[:MAX_VISION_PAGES]
         skipped_set = {m["page_num"] for m in to_vision[MAX_VISION_PAGES:]}
 
+        n_hybrid = sum(1 for m in page_metas if m["mode"] == "hybrid")
+        n_vision_only = sum(1 for m in page_metas if m["mode"] == "vision")
         logger.info(
-            f"PDF: {len(page_metas)} páginas, {len(to_vision)} precisam de Vision "
-            f"({len(to_vision_capped)} processadas, {len(skipped_set)} ignoradas pelo cap)"
+            f"PDF: {len(page_metas)} páginas — "
+            f"{n_vision_only} vision-only, {n_hybrid} híbridas, "
+            f"{len(to_vision_capped)} processadas, {len(skipped_set)} ignoradas pelo cap"
         )
 
         # Passada 2: render lazy + Vision em paralelo
@@ -267,7 +320,6 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
 
             def _vision_one(meta):
                 pn = meta["page_num"]
-                # Renderiza só agora — pix sai de escopo no return e é coletado
                 pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
                 img_bytes = pix.tobytes("png")
                 return pn, analyze_image_with_vision(client, img_bytes, pn)
@@ -279,31 +331,53 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         # Monta o output
         results = []
         pages_with_vision = 0
+        pages_hybrid = 0
         pages_skipped_vision = 0
         failed_pages = []
 
         for meta in page_metas:
             pn = meta["page_num"]
             native = meta["text"]
+            mode = meta["mode"]
+
             if pn in vision_results:
                 vtext = vision_results[pn]
                 if vtext is None:
                     failed_pages.append(pn)
-                    results.append(f"--- Página {pn} (Vision AI falhou - usando texto nativo) ---\n{native}")
+                    if mode == "hybrid":
+                        results.append(
+                            f"--- Página {pn} (Vision AI falhou - usando só texto) ---\n{native}"
+                        )
+                    else:
+                        results.append(
+                            f"--- Página {pn} (Vision AI falhou - usando texto nativo) ---\n{native}"
+                        )
                 else:
                     pages_with_vision += 1
-                    results.append(f"--- Página {pn} (Vision AI) ---\n{vtext}")
+                    if mode == "hybrid":
+                        pages_hybrid += 1
+                        results.append(
+                            f"--- Página {pn} (texto + Vision AI) ---\n{native}\n\n"
+                            f"[Vision AI - conteúdo de imagem]:\n{vtext}"
+                        )
+                    else:
+                        results.append(f"--- Página {pn} (Vision AI) ---\n{vtext}")
             elif pn in skipped_set:
                 pages_skipped_vision += 1
-                results.append(
-                    f"--- Página {pn} (Vision AI ignorada - limite de {MAX_VISION_PAGES} atingido) ---\n{native}"
-                )
+                if mode == "hybrid":
+                    results.append(
+                        f"--- Página {pn} (imagem ignorada - cap de {MAX_VISION_PAGES} atingido; usando só texto) ---\n{native}"
+                    )
+                else:
+                    results.append(
+                        f"--- Página {pn} (Vision AI ignorada - cap de {MAX_VISION_PAGES} atingido) ---\n{native}"
+                    )
             else:
                 results.append(f"--- Página {pn} ---\n{native}")
 
         combined_text = "\n\n".join(results)
         logger.info(
-            f"Concluído: {pages_with_vision} vision ok, "
+            f"Concluído: {pages_with_vision} vision ok ({pages_hybrid} híbridas), "
             f"{len(failed_pages)} falharam, {pages_skipped_vision} ignoradas"
         )
 
@@ -311,6 +385,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             "success": True,
             "total_pages": len(page_metas),
             "pages_with_vision": pages_with_vision,
+            "pages_hybrid": pages_hybrid,
             "pages_skipped_vision": pages_skipped_vision,
             "failed_pages": failed_pages,
             "text": combined_text,
