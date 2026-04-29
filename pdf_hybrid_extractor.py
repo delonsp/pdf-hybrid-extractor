@@ -15,12 +15,17 @@ Ou como servidor Flask para n8n chamar:
 import os
 import sys
 import io
+import re
+import hmac
 import base64
-import tempfile
+import socket
 import argparse
+import ipaddress
 import logging
 import requests
 from pathlib import Path
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -40,24 +45,27 @@ except ImportError:
     HAS_PYMUPDF = False
 
 try:
-    from pdf2image import convert_from_path, convert_from_bytes
-    HAS_PDF2IMAGE = True
+    import mammoth
+    HAS_MAMMOTH = True
 except ImportError:
-    HAS_PDF2IMAGE = False
+    HAS_MAMMOTH = False
 
 # Vision AI (nova SDK google-genai)
 from google import genai
 
 # Config
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN", "XgsXBgexu5HARNDWgtb954QisyNJkB6gvx5PWrGgs7icw3tW")
+API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN")
+TELEFONE_RE = re.compile(r"^\d{8,20}$")
 MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página
 MAX_VISION_PAGES = 15  # máximo de páginas processadas via Vision AI
 GEMINI_TIMEOUT = 60  # segundos por chamada ao Gemini
-# Tenta na ordem: o "latest" auto-bumpa pra versão mais nova quando o Google
-# promove; se falhar (quota zerada, deprecação, etc), cai pro 2.5-flash estável.
-# Sem precisar de deploy quando o Google muda algo.
-VISION_MODELS = ("gemini-flash-latest", "gemini-2.5-flash")
+VISION_PARALLEL = 3  # chamadas Vision paralelas por request (gthread compatível)
+# Primário: alias dinâmico (hoje aponta pro flash mais novo, podendo ser preview/3.x).
+# Fallback: pinned em 2.5-flash (estável). Cascata é per-page — falha pontual no
+# primário não derruba o PDF inteiro.
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-flash-latest")
+VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
 VISION_PROMPT = """Analise esta imagem de um documento médico/exame e extraia TODAS as informações textuais visíveis.
 Inclua:
 - Dados do paciente (nome, idade, data)
@@ -80,107 +88,103 @@ def setup_gemini():
     )
 
 
+def _assert_safe_url(url: str) -> None:
+    """Guarda anti-SSRF: rejeita schemes não-HTTP e IPs internos.
+    Why: bearer dá acesso à rota; sem isso, atacante atinge metadata da nuvem
+    (169.254.169.254) e serviços internos. How to apply: chamar antes de
+    qualquer GET de URL vinda do request body."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL missing host")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"could not resolve host: {host}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            raise ValueError(f"refusing to fetch internal address: {ip}")
+
+
 def download_file(url: str) -> bytes:
-    """Baixa arquivo de URL"""
+    """Baixa arquivo de URL (com guarda anti-SSRF)."""
+    _assert_safe_url(url)
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return resp.content
 
 
-def extract_text_pymupdf(pdf_bytes: bytes) -> list[dict]:
-    """Extrai texto página por página usando PyMuPDF.
-    Imagens são renderizadas sob demanda (lazy) para economizar memória."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-
-    for i, page in enumerate(doc):
-        text = page.get_text().strip()
-        needs_vision = len(text) < MIN_TEXT_THRESHOLD
-
-        img_bytes = None
-        if needs_vision:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom para qualidade
-            img_bytes = pix.tobytes("png")
-
-        pages.append({
-            "page_num": i + 1,
-            "text": text,
-            "text_length": len(text),
-            "needs_vision": needs_vision,
-            "image_bytes": img_bytes
-        })
-
-    doc.close()
-    return pages
+def _detect_type(data: bytes) -> str:
+    """Detecta tipo de documento via magic bytes."""
+    if data.startswith(b"%PDF"):
+        return "pdf"
+    if data.startswith(b"PK\x03\x04"):
+        return "docx"
+    return "unknown"
 
 
-def extract_text_pdf2image(pdf_bytes: bytes) -> list[dict]:
-    """Extrai texto usando pdf2image + pytesseract como fallback"""
-    import pytesseract
-    
-    # Salva temporariamente
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(pdf_bytes)
-        temp_path = f.name
-    
-    try:
-        images = convert_from_path(temp_path, dpi=200)
-        pages = []
-        
-        for i, img in enumerate(images):
-            # OCR básico
-            text = pytesseract.image_to_string(img, lang='por').strip()
-            
-            # Converte para bytes
-            img_buffer = io.BytesIO()
-            img.save(img_buffer, format='PNG')
-            img_bytes = img_buffer.getvalue()
-            
-            pages.append({
-                "page_num": i + 1,
-                "text": text,
-                "text_length": len(text),
-                "image_bytes": img_bytes
-            })
-        
-        return pages
-    finally:
-        os.unlink(temp_path)
+def extract_text_docx(docx_bytes: bytes) -> str:
+    """Extrai texto cru de DOCX via mammoth (sem Vision)."""
+    if not HAS_MAMMOTH:
+        raise RuntimeError("mammoth não instalado. Execute: pip install mammoth")
+    return mammoth.extract_raw_text(io.BytesIO(docx_bytes)).value
 
 
-def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str:
-    """Envia imagem para Gemini Vision (nova SDK), com fallback entre modelos."""
+def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str | None:
+    """Envia imagem para Gemini Vision com cascata primário→fallback.
+
+    Tenta VISION_MODEL primeiro; em falha (exceção, vazio ou safety filter),
+    tenta VISION_MODEL_FALLBACK uma vez. Retorna o primeiro texto não-vazio,
+    ou None se todos falharem. Falha intermediária loga warning; falha final
+    loga exception com stack."""
     from google.genai import types
-
     image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-    last_err = None
-    for model in VISION_MODELS:
+
+    models_to_try = [VISION_MODEL]
+    if VISION_MODEL_FALLBACK and VISION_MODEL_FALLBACK != VISION_MODEL:
+        models_to_try.append(VISION_MODEL_FALLBACK)
+
+    for idx, model_name in enumerate(models_to_try):
+        is_last = idx == len(models_to_try) - 1
         try:
             response = client.models.generate_content(
-                model=model,
+                model=model_name,
                 contents=[VISION_PROMPT, image_part]
             )
-            return response.text
+            text = response.text
+            if text:
+                if idx > 0:
+                    logger.info(f"Página {page_num}: fallback {model_name} ok")
+                return text
+            msg = f"Página {page_num}: {model_name} retornou vazio (provável safety filter)"
+            logger.warning(msg if is_last else f"{msg}, tentando fallback")
         except Exception as e:
-            last_err = e
-            logger.warning(f"Vision {model} falhou na página {page_num}: {e}; tentando próximo")
-    return f"[Erro ao analisar página {page_num}: {last_err}]"
+            if is_last:
+                logger.exception(f"Página {page_num}: {model_name} falhou (último modelo)")
+            else:
+                logger.warning(f"Página {page_num}: {model_name} falhou ({e!r}), tentando fallback")
+    return None
 
 
-def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False, 
+def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                 telefone: str = None, minio_config: dict = None) -> dict:
     """
     Processa PDF com extração híbrida.
-    
-    Args:
-        pdf_source: URL, caminho do arquivo, ou bytes do PDF
-        save_to_minio: Se deve salvar original no Minio
-        telefone: Telefone do paciente (para path no Minio)
-        minio_config: Configuração do Minio
-    
-    Returns:
-        dict com texto combinado e metadados
+
+    - Texto nativo via PyMuPDF.
+    - Páginas com <MIN_TEXT_THRESHOLD chars são renderizadas (lazy) e enviadas
+      ao Gemini Vision em paralelo (até VISION_PARALLEL simultâneas, até
+      MAX_VISION_PAGES no total).
+    - Falha do Vision em página individual não derruba a request: a página
+      vai pra `failed_pages` e o texto nativo é usado como fallback.
     """
+    if not HAS_PYMUPDF:
+        raise RuntimeError("PyMuPDF (fitz) é obrigatório para processar PDFs")
+
     # Obtém bytes do PDF
     if isinstance(pdf_source, bytes):
         pdf_bytes = pdf_source
@@ -188,60 +192,92 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         pdf_bytes = download_file(pdf_source)
     else:
         pdf_bytes = Path(pdf_source).read_bytes()
-    
+
     # Salva no Minio se configurado
     minio_path = None
     if save_to_minio and telefone and minio_config:
         minio_path = save_to_minio_storage(pdf_bytes, telefone, minio_config)
-    
-    # Extrai páginas
-    if HAS_PYMUPDF:
-        pages = extract_text_pymupdf(pdf_bytes)
-    elif HAS_PDF2IMAGE:
-        pages = extract_text_pdf2image(pdf_bytes)
-    else:
-        raise RuntimeError("Instale PyMuPDF (fitz) ou pdf2image para processar PDFs")
-    
-    # Conta quantas páginas precisam de vision
-    vision_needed = sum(1 for p in pages if p.get("needs_vision"))
-    logger.info(f"PDF: {len(pages)} páginas, {vision_needed} precisam de Vision AI")
 
-    # Configura cliente Gemini apenas se necessário
-    client = setup_gemini() if vision_needed > 0 else None
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        # Passada 1: extrai texto e marca páginas que precisam de Vision (sem renderizar ainda)
+        page_metas = []
+        for i, page in enumerate(doc):
+            text = page.get_text().strip()
+            page_metas.append({
+                "page_num": i + 1,
+                "text": text,
+                "needs_vision": len(text) < MIN_TEXT_THRESHOLD,
+            })
 
-    # Processa cada página
-    results = []
-    pages_with_vision = 0
-    pages_skipped_vision = 0
+        # Cap em MAX_VISION_PAGES; o resto é "skipped"
+        to_vision = [m for m in page_metas if m["needs_vision"]]
+        to_vision_capped = to_vision[:MAX_VISION_PAGES]
+        skipped_set = {m["page_num"] for m in to_vision[MAX_VISION_PAGES:]}
 
-    for page in pages:
-        page_num = page["page_num"]
-        text = page["text"]
+        logger.info(
+            f"PDF: {len(page_metas)} páginas, {len(to_vision)} precisam de Vision "
+            f"({len(to_vision_capped)} processadas, {len(skipped_set)} ignoradas pelo cap)"
+        )
 
-        if page.get("needs_vision") and page["image_bytes"]:
-            if pages_with_vision >= MAX_VISION_PAGES:
-                results.append(f"--- Página {page_num} (Vision AI ignorada - limite de {MAX_VISION_PAGES} atingido) ---\n{text}")
+        # Passada 2: render lazy + Vision em paralelo
+        vision_results: dict[int, str | None] = {}
+        if to_vision_capped:
+            client = setup_gemini()
+
+            def _vision_one(meta):
+                pn = meta["page_num"]
+                # Renderiza só agora — pix sai de escopo no return e é coletado
+                pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_bytes = pix.tobytes("png")
+                return pn, analyze_image_with_vision(client, img_bytes, pn)
+
+            with ThreadPoolExecutor(max_workers=VISION_PARALLEL) as ex:
+                for pn, text in ex.map(_vision_one, to_vision_capped):
+                    vision_results[pn] = text
+
+        # Monta o output
+        results = []
+        pages_with_vision = 0
+        pages_skipped_vision = 0
+        failed_pages = []
+
+        for meta in page_metas:
+            pn = meta["page_num"]
+            native = meta["text"]
+            if pn in vision_results:
+                vtext = vision_results[pn]
+                if vtext is None:
+                    failed_pages.append(pn)
+                    results.append(f"--- Página {pn} (Vision AI falhou - usando texto nativo) ---\n{native}")
+                else:
+                    pages_with_vision += 1
+                    results.append(f"--- Página {pn} (Vision AI) ---\n{vtext}")
+            elif pn in skipped_set:
                 pages_skipped_vision += 1
+                results.append(
+                    f"--- Página {pn} (Vision AI ignorada - limite de {MAX_VISION_PAGES} atingido) ---\n{native}"
+                )
             else:
-                logger.info(f"Vision AI: processando página {page_num}/{len(pages)}")
-                vision_text = analyze_image_with_vision(client, page["image_bytes"], page_num)
-                results.append(f"--- Página {page_num} (Vision AI) ---\n{vision_text}")
-                pages_with_vision += 1
-        else:
-            results.append(f"--- Página {page_num} ---\n{text}")
+                results.append(f"--- Página {pn} ---\n{native}")
 
-    combined_text = "\n\n".join(results)
+        combined_text = "\n\n".join(results)
+        logger.info(
+            f"Concluído: {pages_with_vision} vision ok, "
+            f"{len(failed_pages)} falharam, {pages_skipped_vision} ignoradas"
+        )
 
-    logger.info(f"Concluído: {pages_with_vision} vision, {pages_skipped_vision} ignoradas")
-
-    return {
-        "success": True,
-        "total_pages": len(pages),
-        "pages_with_vision": pages_with_vision,
-        "pages_skipped_vision": pages_skipped_vision,
-        "text": combined_text,
-        "minio_path": minio_path
-    }
+        return {
+            "success": True,
+            "total_pages": len(page_metas),
+            "pages_with_vision": pages_with_vision,
+            "pages_skipped_vision": pages_skipped_vision,
+            "failed_pages": failed_pages,
+            "text": combined_text,
+            "minio_path": minio_path,
+        }
+    finally:
+        doc.close()
 
 
 def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str:
@@ -286,7 +322,9 @@ def create_app():
     """Cria app Flask para modo servidor"""
     if not HAS_FLASK:
         raise RuntimeError("Flask não instalado. Execute: pip install flask")
-    
+    if not API_TOKEN:
+        raise RuntimeError("PDF_EXTRACTOR_TOKEN env var must be set to start the server")
+
     app = Flask(__name__)
     
     @app.route("/health", methods=["GET"])
@@ -309,26 +347,46 @@ def create_app():
         Headers:
             Authorization: Bearer <token>
         """
-        # Validação de token
+        # Validação de token (constant-time)
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
-        
-        token = auth_header.replace("Bearer ", "")
-        if token != API_TOKEN:
+        token = auth_header[len("Bearer "):]
+        if not hmac.compare_digest(token, API_TOKEN):
             return jsonify({"error": "Invalid token"}), 403
-        
+
         data = request.json or {}
-        
+
+        # Validação de telefone (rejeita path injection no Minio)
+        telefone = data.get("telefone")
+        if telefone is not None and not TELEFONE_RE.fullmatch(str(telefone)):
+            return jsonify({"error": "telefone deve conter apenas dígitos (8-20)"}), 400
+
         try:
-            # Obtém PDF
+            # Obtém PDF — URL deve ser http/https; download_file aplica guarda anti-SSRF
             if "url" in data:
-                pdf_source = data["url"]
+                url = data["url"]
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    return jsonify({"error": "'url' deve começar com http:// ou https://"}), 400
+                pdf_source = download_file(url)
             elif "base64" in data:
                 pdf_source = base64.b64decode(data["base64"])
             else:
                 return jsonify({"error": "Forneça 'url' ou 'base64'"}), 400
-            
+
+            # Tipo: override via body.type, senão auto-detecta por magic bytes
+            doc_type = (data.get("type") or "").lower() or _detect_type(pdf_source)
+            if doc_type == "docx":
+                return jsonify({
+                    "success": True,
+                    "type": "docx",
+                    "total_pages": 1,
+                    "pages_with_vision": 0,
+                    "pages_skipped_vision": 0,
+                    "text": extract_text_docx(pdf_source),
+                    "minio_path": None,
+                })
+
             # Configuração Minio (do ambiente)
             minio_config = None
             if data.get("save_to_minio"):
@@ -343,12 +401,15 @@ def create_app():
             result = process_pdf(
                 pdf_source,
                 save_to_minio=data.get("save_to_minio", False),
-                telefone=data.get("telefone"),
+                telefone=telefone,
                 minio_config=minio_config
             )
-            
+            result["type"] = "pdf"
+
             return jsonify(result)
-            
+
+        except ValueError as e:
+            return jsonify({"error": str(e), "success": False}), 400
         except Exception as e:
             return jsonify({"error": str(e), "success": False}), 500
     
