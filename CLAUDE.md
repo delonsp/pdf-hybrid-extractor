@@ -32,6 +32,7 @@ No test suite, linter, or formatter is configured.
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — Gemini Vision
 - `PDF_EXTRACTOR_TOKEN` — bearer token for `/extract`. **Required**; `create_app()` raises if missing. No default — service won't start without it.
 - Optional Minio: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_SECURE`, `MINIO_BUCKET`
+- Optional tuning: `VISION_MODEL` (default `gemini-flash-latest`), `VISION_MODEL_FALLBACK` (default `gemini-2.5-flash`), `MAX_DOWNLOAD_BYTES` (default 50 MB), `RATE_LIMIT_DEFAULT` (default `60 per minute`), `RATE_LIMIT_EXTRACT` (default `30 per minute`)
 
 ## Architecture
 
@@ -60,10 +61,17 @@ Optional: original PDF persisted to Minio at `<bucket>/<telefone>/<timestamp>.pd
 ### Security guards (already in place)
 
 - `_assert_safe_url` blocks non-http(s) schemes and any private/loopback/link-local/multicast/reserved IP — anti-SSRF; called from `download_file`.
+- `download_file` streams with a hard cap (`MAX_DOWNLOAD_BYTES`, default 50 MB) — pre-checks `Content-Length` then enforces during chunked read; warns on Content-Type outside `ALLOWED_DOWNLOAD_TYPES`.
 - `/extract` validates `url` starts with `http(s)://` *and* downloads bytes itself, so `process_pdf` never receives an attacker-controlled string (closes path traversal).
 - Token compared with `hmac.compare_digest`; Bearer parsed with slice (not `replace`).
 - `telefone` validated against `TELEFONE_RE = ^\d{8,20}$` before reaching Minio.
+- `save_to_minio=true` without `telefone` is now rejected (was a silent no-op).
 - `create_app()` raises if `PDF_EXTRACTOR_TOKEN` is unset.
+- `flask-limiter` rate-limits per IP (`ProxyFix` reads `X-Forwarded-For` for real client IP behind Traefik/Dokploy). `/health` is exempt. **Note**: storage is in-memory — fine for the single-worker setup; needs Redis if you ever scale to >1 worker/replica.
+- 500 responses are generic ("internal error"); details go to logger only — no stack/path leak to clients. 400 responses (`ValueError`) keep their messages since those are user-actionable.
+- Container runs as non-root user `appuser` (uid 1000).
+- `HEALTHCHECK` in Dockerfile pings `/health` every 30s; orchestrator can detect deadlocked workers.
+- Minio object name uses UTC timestamp + UUID4 hex suffix (`{telefone}/YYYYMMDDTHHMMSSZ_xxxxxxxx.pdf`) — no 1-second collision; consistent across hosts.
 
 ### SDK note
 

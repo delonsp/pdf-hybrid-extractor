@@ -37,6 +37,14 @@ try:
 except ImportError:
     HAS_FLASK = False
 
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    HAS_LIMITER = True
+except ImportError:
+    HAS_LIMITER = False
+
 # PDF processing
 try:
     import fitz  # PyMuPDF
@@ -66,6 +74,15 @@ VISION_PARALLEL = 3  # chamadas Vision paralelas por request (gthread compatíve
 # primário não derruba o PDF inteiro.
 VISION_MODEL = os.getenv("VISION_MODEL", "gemini-flash-latest")
 VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+ALLOWED_DOWNLOAD_TYPES = {
+    "application/pdf",
+    "application/octet-stream",
+    "binary/octet-stream",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "application/zip",  # alguns servers servem .docx assim
+}
 VISION_PROMPT = """Analise esta imagem de um documento médico/exame e extraia TODAS as informações textuais visíveis.
 Inclua:
 - Dados do paciente (nome, idade, data)
@@ -111,11 +128,34 @@ def _assert_safe_url(url: str) -> None:
 
 
 def download_file(url: str) -> bytes:
-    """Baixa arquivo de URL (com guarda anti-SSRF)."""
+    """Baixa arquivo de URL com guarda anti-SSRF, cap de tamanho e check de
+    Content-Type. Streaming pra cortar na primeira excedência sem materializar
+    arquivo gigante na memória."""
     _assert_safe_url(url)
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+    with requests.get(url, timeout=60, stream=True) as resp:
+        resp.raise_for_status()
+
+        # Pre-check via Content-Length (best-effort: alguns servers omitem)
+        clen = resp.headers.get("Content-Length")
+        if clen and clen.isdigit() and int(clen) > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"file too large: {clen} bytes > cap {MAX_DOWNLOAD_BYTES}")
+
+        # Content-Type — warn (não rejeita) em tipos inesperados; magic-bytes
+        # depois detecta de verdade. Rejeitar aqui quebraria servers que
+        # mandam text/plain pra tudo.
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype not in ALLOWED_DOWNLOAD_TYPES:
+            logger.warning(f"Content-Type inesperado: {ctype!r} (continuando)")
+
+        # Stream com cap rígido
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"file too large: exceeded {MAX_DOWNLOAD_BYTES} bytes during download")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _detect_type(data: bytes) -> str:
@@ -280,28 +320,30 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         doc.close()
 
 
-def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str:
-    """Salva PDF no Minio"""
+def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str | None:
+    """Salva PDF no Minio. Object name usa timestamp UTC + sufixo UUID curto
+    (evita colisão quando duas requests do mesmo telefone caem no mesmo
+    segundo)."""
     try:
+        import uuid
         from minio import Minio
-        from datetime import datetime
-        
+        from datetime import datetime, timezone
+
         client = Minio(
             config["endpoint"],
             access_key=config["access_key"],
             secret_key=config["secret_key"],
             secure=config.get("secure", True)
         )
-        
+
         bucket = config.get("bucket", "pacientes")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        object_name = f"{telefone}/{timestamp}.pdf"
-        
-        # Cria bucket se não existir
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        suffix = uuid.uuid4().hex[:8]
+        object_name = f"{telefone}/{timestamp}_{suffix}.pdf"
+
         if not client.bucket_exists(bucket):
             client.make_bucket(bucket)
-        
-        # Upload
+
         client.put_object(
             bucket,
             object_name,
@@ -309,10 +351,10 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str:
             len(pdf_bytes),
             content_type="application/pdf"
         )
-        
+
         return f"{bucket}/{object_name}"
-    except Exception as e:
-        print(f"Erro ao salvar no Minio: {e}", file=sys.stderr)
+    except Exception:
+        logger.exception("Erro ao salvar no Minio")
         return None
 
 
@@ -326,12 +368,24 @@ def create_app():
         raise RuntimeError("PDF_EXTRACTOR_TOKEN env var must be set to start the server")
 
     app = Flask(__name__)
-    
+
+    # Atrás de proxy reverso (Traefik/Dokploy): respeita X-Forwarded-For
+    # pra que get_remote_address devolva IP real do cliente, não do proxy
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+    limiter = Limiter(
+        get_remote_address,
+        app=app,
+        default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "60 per minute")],
+    )
+
     @app.route("/health", methods=["GET"])
+    @limiter.exempt
     def health():
         return jsonify({"status": "ok"})
-    
+
     @app.route("/extract", methods=["POST"])
+    @limiter.limit(os.getenv("RATE_LIMIT_EXTRACT", "30 per minute"))
     def extract():
         """
         Endpoint para extrair texto de PDF.
@@ -361,6 +415,10 @@ def create_app():
         telefone = data.get("telefone")
         if telefone is not None and not TELEFONE_RE.fullmatch(str(telefone)):
             return jsonify({"error": "telefone deve conter apenas dígitos (8-20)"}), 400
+
+        # save_to_minio sem telefone vira no-op silencioso — explicita
+        if data.get("save_to_minio") and not telefone:
+            return jsonify({"error": "save_to_minio=true requer 'telefone'"}), 400
 
         try:
             # Obtém PDF — URL deve ser http/https; download_file aplica guarda anti-SSRF
@@ -409,9 +467,14 @@ def create_app():
             return jsonify(result)
 
         except ValueError as e:
+            # ValueError = input ruim (URL inválida, SSRF, file too large, etc).
+            # Mensagem é útil pro cliente saber o que ajustar.
             return jsonify({"error": str(e), "success": False}), 400
-        except Exception as e:
-            return jsonify({"error": str(e), "success": False}), 500
+        except Exception:
+            # Tudo que não é ValueError vira mensagem genérica — não vaza
+            # paths/hostnames/stack pro cliente. Stack vai pro log.
+            logger.exception("Erro inesperado em /extract")
+            return jsonify({"error": "internal error", "success": False}), 500
     
     return app
 

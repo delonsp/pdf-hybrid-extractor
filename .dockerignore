@@ -1,0 +1,13 @@
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+CLAUDE.md
+.claude/
+.DS_Store
+*.md
+!README.md
