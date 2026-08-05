@@ -106,10 +106,14 @@ class FakeGeminiClient:
     def __init__(self, behavior=None):
         self._behavior = behavior or {}
         self.calls = []  # lista de (model_name, n_contents)
+        self.configs = []  # GenerateContentConfig de cada chamada
 
         outer = self
         class _Models:
-            def generate_content(self, model, contents):
+            def generate_content(self, model, contents, config=None):
+                # config carrega o http_options com o timeout apertado ao
+                # orçamento restante — guardado pra os testes de deadline.
+                outer.configs.append(config)
                 outer.calls.append((model, len(contents)))
                 spec = outer._behavior.get(model, "OK")
                 if isinstance(spec, Exception):

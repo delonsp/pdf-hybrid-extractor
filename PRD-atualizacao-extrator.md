@@ -317,12 +317,12 @@ allowlist) e A8 (config de infra).
 
 - [x] B1. `try/except` por página cobrindo **`get_text()` (passada 1) e o render**, não só o Vision; página quebrada entra em `failed_pages` *(feito junto com o Lote A em 05/08)*
 - [ ] B2. Tirar o PyMuPDF do `ThreadPoolExecutor`: render no fluxo principal com N em voo; paralelizar só a chamada HTTP ao Gemini
-- [ ] B3. **Deadline global por request**, verificado antes de cada onda; derivado do **timeout de 120s do chamador** (~110s), não do gunicorn — ver §4.4b. Inclui baixar `GEMINI_TIMEOUT` para 25-30s e fazer a cascata dividir o orçamento em vez de dobrá-lo
-- [ ] B3b. **Admission control**: com as threads ocupadas, recusar na hora com **503 + `Retry-After`** em vez de enfileirar — fila só converte rejeição rápida em timeout lento, porque a espera é roubada do mesmo orçamento de 120s
-- [ ] B3c. **Abortar trabalho órfão**: detectar desconexão do chamador e parar a extração — hoje a requisição continua consumindo thread e cota do Gemini depois que o webhook já desistiu
+- [x] B3. **Deadline global por request**, verificado antes de cada onda; derivado do **timeout de 120s do chamador** (~110s), não do gunicorn — ver §4.4b. Inclui baixar `GEMINI_TIMEOUT` para 25-30s e fazer a cascata dividir o orçamento em vez de dobrá-lo
+- [x] B3b. **Admission control**: com as threads ocupadas, recusar na hora com **503 + `Retry-After`** em vez de enfileirar — fila só converte rejeição rápida em timeout lento, porque a espera é roubada do mesmo orçamento de 120s
+- [x] B3c. **Abortar trabalho órfão**: detectar desconexão do chamador e parar a extração — hoje a requisição continua consumindo thread e cota do Gemini depois que o webhook já desistiu
 - [ ] B3d. Conferir o **RPM da conta Gemini** antes de subir `VISION_PARALLEL` (5 paralelas × 4 threads = 20 chamadas simultâneas no pico)
-- [ ] B4. Resposta parcial explícita: `complete: false` / `truncated: true` + `WARNING` no log; nunca `success: true` mudo
-- [ ] B5. `MAX_VISION_PAGES`, `VISION_PARALLEL`, `GEMINI_TIMEOUT`, `MIN_TEXT_THRESHOLD` por env
+- [x] B4. Resposta parcial explícita: `complete: false` / `truncated: true` + `WARNING` no log; nunca `success: true` mudo
+- [x] B5. `MAX_VISION_PAGES`, `VISION_PARALLEL`, `GEMINI_TIMEOUT`, `MIN_TEXT_THRESHOLD` por env
 - [ ] B6. `VISION_PROMPT` de **transcrição literal**; descrição visual, se mantida, em campo separado e rotulado
 - [ ] B7. Ler `finish_reason` / `prompt_feedback` / `model_version` e distinguir safety de `MAX_TOKENS` e de vazio
 - [ ] B8. **Medir num DUTCH real de 16 páginas**: as páginas de gráfico são classificadas `native` ou `vision`? Só então decidir entre subir o cap e tratar conteúdo vetorial

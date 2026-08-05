@@ -21,7 +21,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python3 -c "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5050/health',timeout=3).status==200 else 1)" || exit 1
 
 # Gunicorn em produção
-# 1 worker + 4 threads (gthread) para I/O concorrente sem estourar memória
-# timeout 480s: pior caso = ceil(MAX_VISION_PAGES / VISION_PARALLEL) × GEMINI_TIMEOUT
-#   + overhead de render + download (~5×60s + buffer)
-CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "1", "--threads", "4", "--worker-class", "gthread", "--timeout", "480", "pdf_hybrid_extractor:create_app()"]
+# 1 worker + 4 threads (gthread) para I/O concorrente sem estourar memória.
+#
+# ATENÇÃO: com gthread, --timeout NÃO limita a duração de uma request. O worker
+# chama notify() a cada iteração do loop independente das threads estarem presas,
+# então o timeout só detecta worker silencioso/travado. Serve de backstop, nada
+# mais. Quem limita request é o REQUEST_DEADLINE da aplicação (110s por padrão,
+# derivado do timeout de 120s do chamador).
+#
+# --backlog 32: com o default (2048) o kernel aceitaria milhares de conexões que
+# ficariam esperando muito além dos 120s que o chamador aguarda. Fila curta +
+# 503 com Retry-After da aplicação é melhor que timeout lento e silencioso.
+CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "1", "--threads", "4", "--worker-class", "gthread", "--backlog", "32", "--timeout", "480", "pdf_hybrid_extractor:create_app()"]

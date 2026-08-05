@@ -47,6 +47,14 @@ Tests live in `tests/` (pytest + pytest-mock). Gemini and `requests.get` are moc
   - `MAX_RENDER_PIXELS` (20 MP), `VISION_ZOOM` (2.0), `MIN_RENDER_ZOOM` (0.25)
   - `MAX_TOTAL_PAGES` (500), `MAX_OUTPUT_CHARS` (5M)
   - `MAX_DOCX_UNCOMPRESSED_BYTES` (200 MB), `MAX_ZIP_ENTRIES` (2000), `MAX_COMPRESSION_RATIO` (200)
+- Time budget (Lote B — **the numbers are calibration, tune them in Dokploy without a deploy**):
+  - `REQUEST_DEADLINE` (110s) — **must stay below the caller's timeout**, which is 120s for the webhook. Past that, work is guaranteed-discarded while still holding a live thread.
+  - `GEMINI_TIMEOUT` (45s) — measured page latency is 15–19s end-to-end, so a tight 25–30s ceiling would cut exactly the dense reports that matter. Kept loose on purpose; the deadline governs the total, and each call's timeout is additionally clamped to whatever budget remains.
+  - `FALLBACK_MIN_BUDGET` (25s) — the primary→fallback cascade only fires if at least this much budget is left. Unconditional, it doubled a page's cost precisely when time was tightest, stealing the budget from later pages.
+  - `MAX_CONCURRENT_EXTRACTIONS` (3) — deliberately below the gunicorn thread count so a thread is always free for `/health` and for fast 503s. Over capacity returns **503 + `Retry-After`** instead of queueing: waiting comes out of the same 120s budget, so a queue only converts fast rejection into slow, silent timeout.
+  - `RETRY_AFTER_SECONDS` (30), `ABORT_ON_CLIENT_DISCONNECT` (`true`)
+  - `MAX_VISION_PAGES`, `VISION_PARALLEL`, `MIN_TEXT_THRESHOLD` are now env-tunable too (were hardcoded).
+  - **Before raising `VISION_PARALLEL`**: it multiplies by the thread count. 5 × 4 threads = 20 concurrent Gemini calls at peak — check the account's RPM first, or you trade timeouts for mass 429s.
 
 ## Architecture
 
@@ -120,6 +128,12 @@ Uses the new `google-genai` SDK (`from google import genai`), not the deprecated
 - `telefone` (optional): digits only, 8-20
 - `save_to_minio` (optional): bool
 
-Response: `{success, type, total_pages, pages_with_vision, pages_hybrid, pages_skipped_vision, failed_pages, text_truncated, text, minio_path}`. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).
+Response: `{success, complete, type, total_pages, pages_with_vision, pages_hybrid, pages_skipped_vision, pages_deadline_skipped, deadline_exceeded, caller_gone, failed_pages, text_truncated, text, minio_path}`.
+
+**`complete` is the key the caller must check.** It is `false` whenever anything was dropped — page cap, deadline, caller disconnect, per-page failure, or text truncation. `success: true` only means the request itself did not error; it never meant the extraction was whole. Persisting a record without checking `complete` is how an incomplete clinical document gets stored with nobody noticing.
+
+`pages_deadline_skipped` / `deadline_exceeded` are kept separate from `failed_pages` on purpose: running out of budget is not a Vision failure, and conflating them makes diagnosis harder. `caller_gone: true` means the caller disconnected and extraction stopped early.
+
+`503` + `Retry-After` means the server was at capacity — retry with backoff, the request was not processed. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).
 
 `GET /health` is unauthenticated.

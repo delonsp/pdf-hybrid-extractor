@@ -20,6 +20,7 @@ import hmac
 import math
 import time
 import base64
+import select
 import socket
 import zipfile
 import argparse
@@ -70,15 +71,32 @@ from google import genai
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 API_TOKEN = os.getenv("PDF_EXTRACTOR_TOKEN")
 TELEFONE_RE = re.compile(r"^\d{8,20}$")
-MIN_TEXT_THRESHOLD = 50  # caracteres mínimos por página pra evitar Vision
+MIN_TEXT_THRESHOLD = int(os.getenv("MIN_TEXT_THRESHOLD", "50"))  # chars mínimos p/ evitar Vision
 # Cobertura mínima de imagem (área de imagens / área da página) pra ativar modo
 # híbrido (texto nativo + Vision). Cobre laudos com header textual + ultrassom
 # embutido — antes essas páginas tinham >50 chars de texto e a imagem era
 # ignorada silenciosamente.
 IMAGE_COVERAGE_THRESHOLD = float(os.getenv("IMAGE_COVERAGE_THRESHOLD", "0.20"))
-MAX_VISION_PAGES = 15  # máximo de páginas processadas via Vision AI
-GEMINI_TIMEOUT = 60  # segundos por chamada ao Gemini
-VISION_PARALLEL = 3  # chamadas Vision paralelas por request (gthread compatível)
+MAX_VISION_PAGES = int(os.getenv("MAX_VISION_PAGES", "15"))
+VISION_PARALLEL = int(os.getenv("VISION_PARALLEL", "3"))
+# Teto por chamada ao Gemini. Latência medida em produção: 15-19s por página no
+# caminho feliz, então teto curto (25-30s) cortaria justamente as páginas densas
+# — os laudos que interessam. Fica folgado; quem governa o total é o deadline.
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
+# Orçamento total da requisição. Derivado do TIMEOUT DO CHAMADOR (webhook desiste
+# em 120s), não do gunicorn — que com gthread não limita request nenhuma. Passar
+# disso é trabalho garantidamente descartado ocupando thread viva.
+REQUEST_DEADLINE = int(os.getenv("REQUEST_DEADLINE", "110"))
+# Cascata primário→fallback condicional ao orçamento restante. Incondicional, ela
+# dobra o custo da página exatamente quando o tempo está mais apertado; se não
+# cabe outra chamada, é melhor devolver a página como falha e preservar as outras.
+FALLBACK_MIN_BUDGET = int(os.getenv("FALLBACK_MIN_BUDGET", "25"))
+# Admission control: menor que o nº de threads do gunicorn de propósito, pra
+# sempre sobrar thread para o /health e para devolver 503 rápido. Enfileirar não
+# ajuda — a espera sai do mesmo orçamento de 120s do chamador.
+MAX_CONCURRENT_EXTRACTIONS = int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "3"))
+RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "30"))
+ABORT_ON_CLIENT_DISCONNECT = os.getenv("ABORT_ON_CLIENT_DISCONNECT", "true").lower() == "true"
 # Primário: alias dinâmico (hoje aponta pro flash mais novo, podendo ser preview/3.x).
 # Fallback: pinned em 2.5-flash (estável). Cascata é per-page — falha pontual no
 # primário não derruba o PDF inteiro.
@@ -312,13 +330,25 @@ def extract_text_docx(docx_bytes: bytes) -> str:
     return mammoth.extract_raw_text(io.BytesIO(docx_bytes)).value
 
 
-def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str | None:
-    """Envia imagem para Gemini Vision com cascata primário→fallback.
+def _remaining(deadline: float | None) -> float:
+    """Segundos restantes do orçamento da requisição (infinito se não há prazo)."""
+    if deadline is None:
+        return math.inf
+    return deadline - time.monotonic()
+
+
+def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
+                              deadline: float | None = None) -> str | None:
+    """Envia imagem para Gemini Vision com cascata primário→fallback CONDICIONAL
+    ao orçamento restante.
 
     Tenta VISION_MODEL primeiro; em falha (exceção, vazio ou safety filter),
-    tenta VISION_MODEL_FALLBACK uma vez. Retorna o primeiro texto não-vazio,
-    ou None se todos falharem. Falha intermediária loga warning; falha final
-    loga exception com stack."""
+    tenta VISION_MODEL_FALLBACK **apenas se ainda sobrar FALLBACK_MIN_BUDGET**.
+    Incondicional, a cascata dobrava o custo da página justamente quando o tempo
+    estava mais apertado, roubando o prazo das páginas seguintes.
+
+    O timeout de cada chamada também é apertado para o que resta do orçamento —
+    nenhuma chamada individual pode sobreviver ao prazo da requisição."""
     from google.genai import types
     image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
 
@@ -328,10 +358,24 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int) -> str 
 
     for idx, model_name in enumerate(models_to_try):
         is_last = idx == len(models_to_try) - 1
+        left = _remaining(deadline)
+        if idx > 0 and left < FALLBACK_MIN_BUDGET:
+            logger.warning(
+                f"Página {page_num}: pulando fallback — só restam {left:.0f}s "
+                f"do orçamento (mínimo {FALLBACK_MIN_BUDGET}s)"
+            )
+            return None
+        if left <= 0:
+            logger.warning(f"Página {page_num}: orçamento esgotado antes de chamar {model_name}")
+            return None
         try:
+            call_timeout = int(min(GEMINI_TIMEOUT, left) * 1000)  # ms
             response = client.models.generate_content(
                 model=model_name,
-                contents=[VISION_PROMPT, image_part]
+                contents=[VISION_PROMPT, image_part],
+                config=types.GenerateContentConfig(
+                    http_options=types.HttpOptions(timeout=call_timeout)
+                ),
             )
             text = response.text
             if text:
@@ -410,7 +454,8 @@ def _render_page_png(page) -> bytes:
 
 
 def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
-                telefone: str = None, minio_config: dict = None) -> dict:
+                telefone: str = None, minio_config: dict = None,
+                deadline: float = None, is_cancelled=None) -> dict:
     """
     Processa PDF com extração híbrida em 3 modos por página:
     - "native":  só texto via PyMuPDF (texto suficiente E sem imagem grande)
@@ -424,6 +469,13 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     paralelo, até VISION_PARALLEL simultâneas e MAX_VISION_PAGES no total).
     Falha do Vision em página individual cai pro texto nativo (se houver)
     e a página entra em `failed_pages`.
+
+    `deadline` é o instante (time.monotonic) em que a requisição tem que acabar,
+    derivado do timeout do chamador. Ao estourar, as páginas restantes voltam com
+    o texto nativo e a resposta vem marcada como parcial — nunca `success: true`
+    mudo. `is_cancelled` é um callable que indica que o chamador desistiu; a
+    extração para, porque seguir gastando thread e cota do Gemini por resultado
+    que ninguém vai ler é a pior ocupação possível.
     """
     if not HAS_PYMUPDF:
         raise RuntimeError("PyMuPDF (fitz) é obrigatório para processar PDFs")
@@ -509,8 +561,10 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             f"{len(to_vision_capped)} processadas, {len(skipped_set)} ignoradas pelo cap"
         )
 
-        # Passada 2: render lazy + Vision em paralelo
+        # Passada 2: render lazy + Vision em paralelo, dentro do orçamento
         vision_results: dict[int, str | None] = {}
+        aborted_pages: set[int] = set()   # prazo estourado
+        cancelled = False
         if to_vision_capped:
             client = setup_gemini()
 
@@ -520,17 +574,41 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                 # falha no get_pixmap escapava, o ex.map re-levantava e o PDF
                 # inteiro virava 500 — jogando fora as páginas já extraídas.
                 pn = meta["page_num"]
+                # Checagem antes de gastar qualquer coisa nesta página: o
+                # ThreadPoolExecutor já despachou a fila inteira, então páginas
+                # que só começariam depois do prazo desistem aqui, de graça.
+                if is_cancelled is not None and is_cancelled():
+                    return pn, None, "cancelled"
+                if _remaining(deadline) <= 0:
+                    return pn, None, "deadline"
                 try:
                     with doc_lock:
                         img_bytes = _render_page_png(doc[pn - 1])
                 except Exception:
                     logger.exception(f"Página {pn}: falha ao rasterizar")
-                    return pn, None
-                return pn, analyze_image_with_vision(client, img_bytes, pn)
+                    return pn, None, "failed"
+                text = analyze_image_with_vision(client, img_bytes, pn, deadline=deadline)
+                return pn, text, None if text else "failed"
 
             with ThreadPoolExecutor(max_workers=VISION_PARALLEL) as ex:
-                for pn, text in ex.map(_vision_one, to_vision_capped):
+                for pn, text, reason in ex.map(_vision_one, to_vision_capped):
                     vision_results[pn] = text
+                    if reason == "deadline":
+                        aborted_pages.add(pn)
+                    elif reason == "cancelled":
+                        aborted_pages.add(pn)
+                        cancelled = True
+
+            if cancelled:
+                logger.warning(
+                    f"Chamador desistiu — extração interrompida com "
+                    f"{len(aborted_pages)} página(s) pendente(s)"
+                )
+            elif aborted_pages:
+                logger.warning(
+                    f"Prazo de {REQUEST_DEADLINE}s esgotado — "
+                    f"{len(aborted_pages)} página(s) sem Vision"
+                )
 
         # Monta o output
         results = []
@@ -544,7 +622,12 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             native = meta["text"]
             mode = meta["mode"]
 
-            if pn in vision_results:
+            if pn in aborted_pages:
+                # Prazo estourado / chamador desistiu: não é falha do Vision,
+                # é orçamento. Marcador próprio pra não confundir diagnóstico.
+                motivo = "chamador desistiu" if cancelled else f"prazo de {REQUEST_DEADLINE}s esgotado"
+                results.append(f"--- Página {pn} ({motivo} - usando texto nativo) ---\n{native}")
+            elif pn in vision_results:
                 vtext = vision_results[pn]
                 if vtext is None:
                     failed_pages.append(pn)
@@ -598,12 +681,24 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             f"{len(failed_pages)} falharam, {pages_skipped_vision} ignoradas"
         )
 
+        # `complete` é a chave honesta: nada foi cortado por cap, prazo,
+        # desistência do chamador ou truncamento de texto. Antes a resposta
+        # vinha `success: true` mesmo com páginas descartadas, e um prontuário
+        # incompleto era gravado sem ninguém perceber.
+        complete = not (
+            pages_skipped_vision or aborted_pages or text_truncated or failed_pages
+        )
+
         return {
             "success": True,
+            "complete": complete,
             "total_pages": len(page_metas),
             "pages_with_vision": pages_with_vision,
             "pages_hybrid": pages_hybrid,
             "pages_skipped_vision": pages_skipped_vision,
+            "pages_deadline_skipped": sorted(aborted_pages),
+            "deadline_exceeded": bool(aborted_pages) and not cancelled,
+            "caller_gone": cancelled,
             "failed_pages": failed_pages,
             "text_truncated": text_truncated,
             "text": combined_text,
@@ -652,6 +747,39 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str 
 
 
 # === Modo Servidor Flask ===
+
+# Contador de extrações em voo. Deliberadamente MENOR que o nº de threads do
+# gunicorn: sempre sobra thread pro /health responder e pra devolver 503 rápido.
+_extract_slots = threading.BoundedSemaphore(MAX_CONCURRENT_EXTRACTIONS)
+
+
+def _make_cancel_check():
+    """Callable que diz se o chamador foi embora, ou None se não dá pra saber.
+
+    O webhook desiste em 120s, mas a thread daqui continuava trabalhando — cota
+    do Gemini e thread gastas por resultado que ninguém vai ler. É preciso pegar
+    o socket AQUI (dentro do contexto de request); as threads do executor não
+    têm acesso a `request`.
+
+    Conservador de propósito: só reporta desistência em EOF certo. Qualquer
+    incerteza devolve False — abortar trabalho válido por engano seria pior."""
+    if not ABORT_ON_CLIENT_DISCONNECT:
+        return None
+    sock = request.environ.get("gunicorn.socket")
+    if sock is None:  # dev server / test client não expõem socket
+        return None
+
+    def _cancelled():
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if not readable:
+                return False
+            # Legível e sem dados = peer fechou. Com dados seria pipelining.
+            return sock.recv(1, socket.MSG_PEEK) == b""
+        except Exception:
+            return False
+
+    return _cancelled
 
 def create_app():
     """Cria app Flask para modo servidor"""
@@ -728,7 +856,26 @@ def create_app():
         if data.get("save_to_minio") and not telefone:
             return jsonify({"error": "save_to_minio=true requer 'telefone'"}), 400
 
+        # Admission control: com tudo ocupado, recusar AGORA. Enfileirar não
+        # ajuda — a espera sairia do mesmo orçamento de 120s do chamador, então
+        # a fila só converteria rejeição rápida em timeout lento e silencioso.
+        if not _extract_slots.acquire(blocking=False):
+            logger.warning(
+                f"Capacidade cheia ({MAX_CONCURRENT_EXTRACTIONS} extrações em voo) — 503"
+            )
+            resp = jsonify({
+                "error": "servidor ocupado, tente novamente",
+                "success": False,
+            })
+            return resp, 503, {"Retry-After": str(RETRY_AFTER_SECONDS)}
+
+        # Tudo daqui pra baixo dentro do try/finally: qualquer exceção entre o
+        # acquire e o finally vazaria o slot PARA SEMPRE, e o serviço se
+        # estrangularia sozinho sem nunca voltar.
         try:
+            deadline = time.monotonic() + REQUEST_DEADLINE
+            cancel_check = _make_cancel_check()
+
             # Obtém PDF — URL deve ser http/https; download_file aplica guarda anti-SSRF
             if "url" in data:
                 url = data["url"]
@@ -763,10 +910,17 @@ def create_app():
             if doc_type == "docx":
                 return jsonify({
                     "success": True,
+                    "complete": True,
                     "type": "docx",
                     "total_pages": 1,
                     "pages_with_vision": 0,
+                    "pages_hybrid": 0,
                     "pages_skipped_vision": 0,
+                    "pages_deadline_skipped": [],
+                    "deadline_exceeded": False,
+                    "caller_gone": False,
+                    "failed_pages": [],
+                    "text_truncated": False,
                     "text": extract_text_docx(pdf_source),
                     "minio_path": None,
                 })
@@ -786,7 +940,9 @@ def create_app():
                 pdf_source,
                 save_to_minio=data.get("save_to_minio", False),
                 telefone=telefone,
-                minio_config=minio_config
+                minio_config=minio_config,
+                deadline=deadline,
+                is_cancelled=cancel_check,
             )
             result["type"] = "pdf"
 
@@ -801,6 +957,8 @@ def create_app():
             # paths/hostnames/stack pro cliente. Stack vai pro log.
             logger.exception("Erro inesperado em /extract")
             return jsonify({"error": "internal error", "success": False}), 500
+        finally:
+            _extract_slots.release()
     
     return app
 
