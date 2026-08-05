@@ -26,7 +26,7 @@ docker build -t pdf-hybrid-extractor . && docker run -p 5050:5050 -e GEMINI_API_
 
 # Tests
 pip install -r requirements-dev.txt
-pytest                          # 70 tests, ~0.3s
+pytest                          # 101 tests, ~1s
 pytest tests/test_vision.py -v  # single file
 pytest -k "encrypted or ssrf"   # by name pattern
 ```
@@ -39,6 +39,14 @@ Tests live in `tests/` (pytest + pytest-mock). Gemini and `requests.get` are moc
 - `PDF_EXTRACTOR_TOKEN` — bearer token for `/extract`. **Required**; `create_app()` raises if missing. No default — service won't start without it.
 - Optional Minio: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_SECURE`, `MINIO_BUCKET`
 - Optional tuning: `VISION_MODEL` (default `gemini-flash-latest`), `VISION_MODEL_FALLBACK` (default `gemini-2.5-flash`), `MAX_DOWNLOAD_BYTES` (default 50 MB), `IMAGE_COVERAGE_THRESHOLD` (default 0.20), `RATE_LIMIT_DEFAULT` (default `60 per minute`), `RATE_LIMIT_EXTRACT` (default `30 per minute`)
+- Optional limits (added in the Lote A hardening — see `PRD-atualizacao-extrator.md`):
+  - `ALLOWED_DOWNLOAD_HOSTS` — comma-separated **suffix** allowlist (e.g. `backblazeb2.com,temp-file.download`). Suffix, not full host, on purpose: Z-API serves media from `f004.backblazeb2.com`, and a bucket migration to `f005` must not break ingestion. Empty = disabled.
+  - `ALLOWED_DOWNLOAD_HOSTS_ENFORCE` (default `false`) — **two-stage rollout by design.** With the list set but enforce off, an out-of-list host only logs a WARNING and the download proceeds; a new domain becomes a log line instead of a silently lost report. Flip to `true` only after observing real traffic. Setting the list alone can never break production. **Enforcing closes both redirect-based SSRF and DNS rebinding**, since every hop must resolve to a known host.
+  - Every download logs its origin **host only** (`[origem] download de <host>`) — never the full URL, whose path carries a signed token and the patient's file id. This is what accumulates the real domain list before enforcing.
+  - `MAX_REDIRECTS` (3), `DOWNLOAD_DEADLINE` (120s total, not per-socket), `DOWNLOAD_CONNECT_TIMEOUT` (10s), `DOWNLOAD_READ_TIMEOUT` (30s)
+  - `MAX_RENDER_PIXELS` (20 MP), `VISION_ZOOM` (2.0), `MIN_RENDER_ZOOM` (0.25)
+  - `MAX_TOTAL_PAGES` (500), `MAX_OUTPUT_CHARS` (5M)
+  - `MAX_DOCX_UNCOMPRESSED_BYTES` (200 MB), `MAX_ZIP_ENTRIES` (2000), `MAX_COMPRESSION_RATIO` (200)
 
 ## Architecture
 
@@ -68,14 +76,25 @@ Optional: original PDF persisted to Minio at `<bucket>/<telefone>/<timestamp>.pd
 
 `MIN_TEXT_THRESHOLD` (50), `IMAGE_COVERAGE_THRESHOLD` (0.20 — ratio of page area covered by raster images to trigger hybrid mode), `MAX_VISION_PAGES` (15), `GEMINI_TIMEOUT` (60s, passed as ms to the SDK's `http_options`), `VISION_PARALLEL` (3), `VISION_MODEL`, `VISION_PROMPT`, `TELEFONE_RE`. Tune these before adding new knobs.
 
-### Gunicorn config rationale
+### Gunicorn config rationale — **two claims here were wrong; corrected 2026-08-05**
 
-`workers=1 threads=4 gthread timeout=480`. Single worker keeps memory bounded; gthread serves multiple HTTP requests concurrently. Each request *also* spins up its own `ThreadPoolExecutor(max_workers=VISION_PARALLEL=3)` for parallel Gemini calls — those are independent of gunicorn's thread pool. Worst-case Vision time per request: `ceil(MAX_VISION_PAGES / VISION_PARALLEL) × GEMINI_TIMEOUT = ceil(15/3) × 60 = 300s`; the 480s timeout buffers render + I/O overhead. Don't blindly raise `workers` without checking memory.
+`workers=1 threads=4 gthread timeout=480`. Single worker keeps memory bounded; gthread serves multiple HTTP requests concurrently. Each request *also* spins up its own `ThreadPoolExecutor(max_workers=VISION_PARALLEL=3)` for parallel Gemini calls — those are independent of gunicorn's thread pool.
+
+**⚠ `--timeout 480` does NOT bound request duration here.** Verified in gunicorn's `workers/gthread.py`: the worker loop calls `self.notify()` unconditionally every iteration, without checking whether request threads are stuck. With `gthread`, `timeout` is a *silent-worker* detector, not a request cap. A slow extraction runs indefinitely, holding one of the 4 threads; four of them and the service stops responding with no crash, no error log, and no restart. **The only enforceable time cap is a deadline in application code** (PRD item B3 — not yet implemented).
+
+**⚠ Worst-case Vision time was understated.** The documented `ceil(15/3) × 60 = 300s` ignores the primary→fallback cascade, which costs up to `2 × GEMINI_TIMEOUT` per page: `5 waves × 120s = 600s`, before any retry. Any change to `MAX_VISION_PAGES`, `VISION_PARALLEL`, `GEMINI_TIMEOUT` or retry must be sized in one shared budget.
+
+Don't blindly raise `workers` without checking memory — and note it would also multiply the in-memory rate limit by N.
 
 ### Security guards (already in place)
 
-- `_assert_safe_url` blocks non-http(s) schemes and any private/loopback/link-local/multicast/reserved IP — anti-SSRF; called from `download_file`.
-- `download_file` streams with a hard cap (`MAX_DOWNLOAD_BYTES`, default 50 MB) — pre-checks `Content-Length` then enforces during chunked read; warns on Content-Type outside `ALLOWED_DOWNLOAD_TYPES`.
+- `_assert_safe_url` blocks non-http(s) schemes, hosts outside `ALLOWED_DOWNLOAD_HOSTS` (when set), and any private/loopback/link-local/multicast/reserved IP — anti-SSRF.
+- **`download_file` follows redirects manually (`allow_redirects=False`) and re-runs the guard on every hop.** Previously `requests` followed them itself and the guard had only seen the original URL — a public host answering `302 → 169.254.169.254` (cloud metadata) or `→ 10.x.x.x` (internal Minio) went straight through. Relative `Location` is resolved with `urljoin`; hops capped by `MAX_REDIRECTS`.
+- **Known gap:** DNS rebinding is still open (the guard resolves, then `requests` resolves again). Setting `ALLOWED_DOWNLOAD_HOSTS` is what closes it.
+- `download_file` streams with a hard cap (`MAX_DOWNLOAD_BYTES`, default 50 MB) — pre-checks `Content-Length` then enforces during chunked read; warns on Content-Type outside `ALLOWED_DOWNLOAD_TYPES`. `DOWNLOAD_DEADLINE` bounds total time (requests' `timeout` is per-socket-op, so a slow-drip server could hold a thread forever).
+- **Resource caps** (each one guards a way to kill the single worker that the byte cap does not): `MAX_CONTENT_LENGTH` on the Flask app (base64 inflates 4/3, so the body existed three times over); base64 length checked *before* decoding; `MAX_RENDER_PIXELS` (a tiny PDF with a huge MediaBox made `get_pixmap` allocate GB); `MAX_TOTAL_PAGES`; `MAX_OUTPUT_CHARS`; and DOCX zip-bomb limits (uncompressed size, entry count, compression ratio) applied *before* mammoth reads anything.
+- **All HTTP errors return JSON** via an `HTTPException` handler — 413/415/404/405/429 used to come back as HTML and break n8n's parsing.
+- **Per-page failure isolation:** both `get_text()` (pass 1) and the render are wrapped per page. A corrupt page lands in `failed_pages`; previously an exception escaped `ThreadPoolExecutor.map` and turned the whole document into a 500, discarding pages already extracted.
 - `/extract` validates `url` starts with `http(s)://` *and* downloads bytes itself, so `process_pdf` never receives an attacker-controlled string (closes path traversal).
 - Token compared with `hmac.compare_digest`; Bearer parsed with slice (not `replace`).
 - `telefone` validated against `TELEFONE_RE = ^\d{8,20}$` before reaching Minio.
@@ -101,6 +120,6 @@ Uses the new `google-genai` SDK (`from google import genai`), not the deprecated
 - `telefone` (optional): digits only, 8-20
 - `save_to_minio` (optional): bool
 
-Response: `{success, type, total_pages, pages_with_vision, pages_hybrid, pages_skipped_vision, failed_pages, text, minio_path}`. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).
+Response: `{success, type, total_pages, pages_with_vision, pages_hybrid, pages_skipped_vision, failed_pages, text_truncated, text, minio_path}`. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).
 
 `GET /health` is unauthenticated.
