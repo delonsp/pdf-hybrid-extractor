@@ -33,6 +33,57 @@ class TestAuth:
         assert r.status_code == 400
 
 
+class TestBodyLimits:
+    """Sem MAX_CONTENT_LENGTH, um POST gigante existia como bytes crus, string
+    base64 e bytes decodificados ao mesmo tempo — 1 request matava o worker."""
+
+    def test_max_content_length_is_set(self, app):
+        cap = app.config["MAX_CONTENT_LENGTH"]
+        assert cap is not None
+        # tem que caber o cap de download inflado em base64 (4/3), com folga
+        assert cap > pdfx.MAX_DOWNLOAD_BYTES
+
+    def test_oversized_body_returns_413_json(self, client, auth_header, app):
+        payload = b"x" * (app.config["MAX_CONTENT_LENGTH"] + 1024)
+        r = client.post("/extract", data=payload,
+                        content_type="application/json", headers=auth_header)
+        assert r.status_code == 413
+        assert r.is_json
+        assert r.get_json()["success"] is False
+
+    def test_base64_above_cap_rejected_before_decode(self, client, auth_header, monkeypatch):
+        monkeypatch.setattr(pdfx, "MAX_DOWNLOAD_BYTES", 100)
+        r = client.post("/extract", json={"base64": "A" * 400}, headers=auth_header)
+        assert r.status_code == 400
+        assert "grande demais" in r.get_json()["error"]
+
+    def test_base64_not_a_string(self, client, auth_header):
+        r = client.post("/extract", json={"base64": 12345}, headers=auth_header)
+        assert r.status_code == 400
+        assert "string" in r.get_json()["error"]
+
+
+class TestErrorsAreJson:
+    """n8n espera {"error": ...}; HTML quebrava o parsing do lado dele."""
+
+    def test_non_json_body_returns_json_error(self, client, auth_header):
+        r = client.post("/extract", data="isso não é json",
+                        content_type="text/plain", headers=auth_header)
+        assert r.status_code in (400, 415)
+        assert r.is_json, "erro veio em HTML"
+        assert r.get_json()["success"] is False
+
+    def test_unknown_route_returns_json(self, client):
+        r = client.get("/nao-existe")
+        assert r.status_code == 404
+        assert r.is_json
+
+    def test_wrong_method_returns_json(self, client):
+        r = client.get("/extract")
+        assert r.status_code == 405
+        assert r.is_json
+
+
 class TestInputValidation:
     def test_no_url_no_base64(self, client, auth_header):
         r = client.post("/extract", json={}, headers=auth_header)

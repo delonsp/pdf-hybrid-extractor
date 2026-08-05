@@ -17,15 +17,18 @@ import sys
 import io
 import re
 import hmac
+import math
+import time
 import base64
 import socket
+import zipfile
 import argparse
 import ipaddress
 import logging
 import threading
 import requests
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 # Opcional: Flask para modo servidor
 try:
     from flask import Flask, request, jsonify
+    from werkzeug.exceptions import HTTPException
     HAS_FLASK = True
 except ImportError:
     HAS_FLASK = False
@@ -81,6 +85,36 @@ VISION_PARALLEL = 3  # chamadas Vision paralelas por request (gthread compatíve
 VISION_MODEL = os.getenv("VISION_MODEL", "gemini-flash-latest")
 VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+# Redirects: seguidos manualmente pra revalidar CADA hop contra o guard anti-SSRF.
+# requests seguiria sozinho e o guard só teria visto a URL inicial — um 302 para
+# 169.254.169.254 (metadata da nuvem) ou pra rede interna passava direto.
+MAX_REDIRECTS = int(os.getenv("MAX_REDIRECTS", "3"))
+# Allowlist opcional de hosts de origem (ex: "media.z-api.io,meu-minio.exemplo.com").
+# Vazio = desligada (só o guard de IP privado vale). Ligar fecha redirect E DNS
+# rebinding de uma vez, porque o host precisa ser conhecido em todo hop.
+ALLOWED_DOWNLOAD_HOSTS = {
+    h.strip().lower().rstrip(".")
+    for h in os.getenv("ALLOWED_DOWNLOAD_HOSTS", "").split(",")
+    if h.strip()
+}
+# Deadline TOTAL do download. O timeout do requests é por operação de socket: um
+# servidor que manda poucos bytes a cada N segundos segura a thread pra sempre.
+DOWNLOAD_DEADLINE = int(os.getenv("DOWNLOAD_DEADLINE", "120"))  # segundos
+DOWNLOAD_CONNECT_TIMEOUT = int(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "10"))
+DOWNLOAD_READ_TIMEOUT = int(os.getenv("DOWNLOAD_READ_TIMEOUT", "30"))
+# Teto de rasterização. Nem o cap de bytes nem o de páginas protege disso: um PDF
+# de poucos KB com MediaBox gigante faz o get_pixmap alocar GB — × VISION_PARALLEL.
+# Pixmap RGB gasta ~3 bytes/pixel, então 20 MP ≈ 60 MB por página em voo.
+MAX_RENDER_PIXELS = int(os.getenv("MAX_RENDER_PIXELS", str(20_000_000)))
+VISION_ZOOM = float(os.getenv("VISION_ZOOM", "2.0"))
+MIN_RENDER_ZOOM = float(os.getenv("MIN_RENDER_ZOOM", "0.25"))
+MAX_TOTAL_PAGES = int(os.getenv("MAX_TOTAL_PAGES", "500"))
+MAX_OUTPUT_CHARS = int(os.getenv("MAX_OUTPUT_CHARS", str(5_000_000)))
+# Limites de expansão do ZIP do DOCX (zip bomb): conferir a estrutura não protege
+# contra descompressão abusiva — um .docx de poucos MB vira GB dentro do mammoth.
+MAX_DOCX_UNCOMPRESSED = int(os.getenv("MAX_DOCX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
+MAX_ZIP_ENTRIES = int(os.getenv("MAX_ZIP_ENTRIES", "2000"))
+MAX_COMPRESSION_RATIO = float(os.getenv("MAX_COMPRESSION_RATIO", "200"))
 ALLOWED_DOWNLOAD_TYPES = {
     "application/pdf",
     "application/octet-stream",
@@ -111,17 +145,29 @@ def setup_gemini():
     )
 
 
+def _host_allowed(host: str) -> bool:
+    """Host bate na allowlist (match exato ou subdomínio). Allowlist vazia = tudo
+    liberado (só o guard de IP privado vale)."""
+    if not ALLOWED_DOWNLOAD_HOSTS:
+        return True
+    host = host.lower().rstrip(".")
+    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOWNLOAD_HOSTS)
+
+
 def _assert_safe_url(url: str) -> None:
-    """Guarda anti-SSRF: rejeita schemes não-HTTP e IPs internos.
+    """Guarda anti-SSRF: rejeita schemes não-HTTP, hosts fora da allowlist (quando
+    configurada) e IPs internos.
     Why: bearer dá acesso à rota; sem isso, atacante atinge metadata da nuvem
     (169.254.169.254) e serviços internos. How to apply: chamar antes de
-    qualquer GET de URL vinda do request body."""
+    CADA hop HTTP — não só na URL original (ver download_file)."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"unsupported URL scheme: {parsed.scheme!r}")
     host = parsed.hostname
     if not host:
         raise ValueError("URL missing host")
+    if not _host_allowed(host):
+        raise ValueError(f"host not in allowlist: {host}")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
@@ -133,35 +179,62 @@ def _assert_safe_url(url: str) -> None:
             raise ValueError(f"refusing to fetch internal address: {ip}")
 
 
+def _read_capped(resp, deadline: float) -> bytes:
+    """Lê o corpo com cap de tamanho e deadline total."""
+    clen = resp.headers.get("Content-Length")
+    if clen and clen.isdigit() and int(clen) > MAX_DOWNLOAD_BYTES:
+        raise ValueError(f"file too large: {clen} bytes > cap {MAX_DOWNLOAD_BYTES}")
+
+    # Content-Type — warn (não rejeita) em tipos inesperados; magic-bytes
+    # depois detecta de verdade. Rejeitar aqui quebraria servers que
+    # mandam text/plain pra tudo.
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype and ctype not in ALLOWED_DOWNLOAD_TYPES:
+        logger.warning(f"Content-Type inesperado: {ctype!r} (continuando)")
+
+    buf = io.BytesIO()
+    total = 0
+    for chunk in resp.iter_content(chunk_size=64 * 1024):
+        if time.monotonic() > deadline:
+            raise ValueError(f"download exceeded deadline of {DOWNLOAD_DEADLINE}s")
+        total += len(chunk)
+        if total > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"file too large: exceeded {MAX_DOWNLOAD_BYTES} bytes during download")
+        buf.write(chunk)
+    return buf.getvalue()
+
+
 def download_file(url: str) -> bytes:
-    """Baixa arquivo de URL com guarda anti-SSRF, cap de tamanho e check de
-    Content-Type. Streaming pra cortar na primeira excedência sem materializar
-    arquivo gigante na memória."""
-    _assert_safe_url(url)
-    with requests.get(url, timeout=60, stream=True) as resp:
-        resp.raise_for_status()
+    """Baixa arquivo de URL revalidando o guard anti-SSRF em CADA redirect.
 
-        # Pre-check via Content-Length (best-effort: alguns servers omitem)
-        clen = resp.headers.get("Content-Length")
-        if clen and clen.isdigit() and int(clen) > MAX_DOWNLOAD_BYTES:
-            raise ValueError(f"file too large: {clen} bytes > cap {MAX_DOWNLOAD_BYTES}")
-
-        # Content-Type — warn (não rejeita) em tipos inesperados; magic-bytes
-        # depois detecta de verdade. Rejeitar aqui quebraria servers que
-        # mandam text/plain pra tudo.
-        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype and ctype not in ALLOWED_DOWNLOAD_TYPES:
-            logger.warning(f"Content-Type inesperado: {ctype!r} (continuando)")
-
-        # Stream com cap rígido
-        chunks = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                raise ValueError(f"file too large: exceeded {MAX_DOWNLOAD_BYTES} bytes during download")
-            chunks.append(chunk)
-        return b"".join(chunks)
+    requests segue redirect por padrão e o guard só teria visto a URL inicial —
+    um servidor externo devolvendo `302 -> 169.254.169.254` furava a proteção.
+    Aqui os hops são seguidos à mão (`allow_redirects=False`), com `urljoin` pra
+    `Location` relativo, teto de hops, cap de tamanho e deadline total."""
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        _assert_safe_url(current)
+        resp = requests.get(
+            current,
+            timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
+            stream=True,
+            allow_redirects=False,
+        )
+        try:
+            if resp.is_redirect or resp.is_permanent_redirect:
+                location = resp.headers.get("Location")
+                if not location:
+                    raise ValueError("redirect without Location header")
+                # Location pode ser relativo — resolver contra a URL atual,
+                # senão o guard receberia algo que não é URL absoluta.
+                current = urljoin(current, location)
+                continue
+            resp.raise_for_status()
+            return _read_capped(resp, deadline)
+        finally:
+            resp.close()
+    raise ValueError(f"too many redirects (max {MAX_REDIRECTS})")
 
 
 def _detect_type(data: bytes) -> str:
@@ -173,10 +246,45 @@ def _detect_type(data: bytes) -> str:
     return "unknown"
 
 
+def _assert_safe_docx(docx_bytes: bytes) -> None:
+    """Valida estrutura do DOCX e barra zip bomb ANTES de entregar ao mammoth.
+
+    Conferir só a estrutura não protege: um .docx de poucos MB pode expandir para
+    GB durante a leitura. Os três limites (tamanho descomprimido, nº de entradas
+    e taxa de compressão) são lidos do índice do ZIP, sem descomprimir nada."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(docx_bytes))
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"DOCX inválido (não é um ZIP legível): {e}") from e
+
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_ENTRIES:
+            raise ValueError(f"DOCX com entradas demais: {len(infos)} > {MAX_ZIP_ENTRIES}")
+
+        names = {i.filename for i in infos}
+        # Todo ZIP começa com PK\x03\x04 — xlsx/pptx caíam aqui e morriam com
+        # erro confuso do mammoth. Exigir a parte que só existe em DOCX.
+        if "word/document.xml" not in names:
+            raise ValueError("arquivo ZIP não é um DOCX (falta word/document.xml)")
+
+        total_uncompressed = sum(i.file_size for i in infos)
+        if total_uncompressed > MAX_DOCX_UNCOMPRESSED:
+            raise ValueError(
+                f"DOCX expande demais: {total_uncompressed} bytes > cap {MAX_DOCX_UNCOMPRESSED}"
+            )
+        ratio = total_uncompressed / max(len(docx_bytes), 1)
+        if ratio > MAX_COMPRESSION_RATIO:
+            raise ValueError(
+                f"taxa de compressão suspeita ({ratio:.0f}x > {MAX_COMPRESSION_RATIO:.0f}x)"
+            )
+
+
 def extract_text_docx(docx_bytes: bytes) -> str:
     """Extrai texto cru de DOCX via mammoth (sem Vision)."""
     if not HAS_MAMMOTH:
         raise RuntimeError("mammoth não instalado. Execute: pip install mammoth")
+    _assert_safe_docx(docx_bytes)
     return mammoth.extract_raw_text(io.BytesIO(docx_bytes)).value
 
 
@@ -245,6 +353,38 @@ def _page_image_coverage(page) -> float:
     return min(total / page_area, 1.0)
 
 
+def _render_page_png(page) -> bytes:
+    """Rasteriza a página em PNG respeitando MAX_RENDER_PIXELS.
+
+    Uma página com MediaBox gigante faria o get_pixmap alocar centenas de MB a GB
+    — o cap de bytes do download não protege disso, porque o PDF em si pode ter
+    poucos KB. Aqui o zoom é reduzido até caber no teto; se para caber ele tiver
+    que ficar abaixo de MIN_RENDER_ZOOM, a página é recusada como falha isolada
+    (render ilegível não vale a chamada ao Gemini) em vez de derrubar o processo."""
+    rect = page.rect
+    width, height = abs(rect.width), abs(rect.height)
+    if not width or not height:
+        raise ValueError("página com dimensão zero")
+
+    zoom = VISION_ZOOM
+    if width * height * zoom * zoom > MAX_RENDER_PIXELS:
+        zoom = math.sqrt(MAX_RENDER_PIXELS / (width * height))
+        # Abaixo de um piso o render sai ilegível e a chamada ao Gemini seria
+        # gasto sem retorno — melhor falhar a página do que mandar borrão.
+        if zoom < MIN_RENDER_ZOOM:
+            raise ValueError(
+                f"página grande demais para rasterizar de forma legível "
+                f"({width:.0f}x{height:.0f}pt, zoom cairia para {zoom:.3f})"
+            )
+        logger.warning(
+            f"Página {page.number + 1}: {width:.0f}x{height:.0f}pt excede "
+            f"MAX_RENDER_PIXELS, zoom reduzido para {zoom:.2f}"
+        )
+
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    return pix.tobytes("png")
+
+
 def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                 telefone: str = None, minio_config: dict = None) -> dict:
     """
@@ -288,6 +428,13 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         doc.close()
         raise ValueError("PDF está criptografado/protegido por senha")
 
+    # Cap de páginas: um PDF de poucos KB pode declarar milhares de páginas, e a
+    # passada 1 roda get_text() em todas antes de qualquer outro limite valer.
+    if doc.page_count > MAX_TOTAL_PAGES:
+        page_count = doc.page_count
+        doc.close()
+        raise ValueError(f"PDF com páginas demais: {page_count} > cap {MAX_TOTAL_PAGES}")
+
     # Lock pra render do PyMuPDF: MuPDF NÃO é thread-safe num mesmo Document.
     # Render é rápido (~50-200ms); a chamada Gemini lenta (5-30s) continua
     # paralela. Sem isso há risco de pixmap corrompido / segfault sob carga.
@@ -296,8 +443,17 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     try:
         # Passada 1: classifica cada página em native | vision | hybrid (sem renderizar)
         page_metas = []
+        classify_failed = []
         for i, page in enumerate(doc):
-            text = page.get_text().strip()
+            # get_text() também estoura em página corrompida (JBIG2/JPX quebrado,
+            # xref inconsistente). Sem esta guarda, a passada 1 inteira morria e
+            # o documento todo virava 500 — inclusive as páginas boas.
+            try:
+                text = page.get_text().strip()
+            except Exception:
+                logger.exception(f"Página {i + 1}: falha ao extrair texto nativo")
+                classify_failed.append(i + 1)
+                text = ""
             has_text = len(text) >= MIN_TEXT_THRESHOLD
             img_coverage = _page_image_coverage(page)
             has_significant_image = img_coverage >= IMAGE_COVERAGE_THRESHOLD
@@ -335,10 +491,17 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             client = setup_gemini()
 
             def _vision_one(meta):
+                # try/except cobrindo o RENDER, não só a chamada ao Gemini:
+                # analyze_image_with_vision engole as próprias exceções, mas uma
+                # falha no get_pixmap escapava, o ex.map re-levantava e o PDF
+                # inteiro virava 500 — jogando fora as páginas já extraídas.
                 pn = meta["page_num"]
-                with doc_lock:
-                    pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(2, 2))
-                    img_bytes = pix.tobytes("png")
+                try:
+                    with doc_lock:
+                        img_bytes = _render_page_png(doc[pn - 1])
+                except Exception:
+                    logger.exception(f"Página {pn}: falha ao rasterizar")
+                    return pn, None
                 return pn, analyze_image_with_vision(client, img_bytes, pn)
 
             with ThreadPoolExecutor(max_workers=VISION_PARALLEL) as ex:
@@ -392,7 +555,20 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             else:
                 results.append(f"--- Página {pn} ---\n{native}")
 
+        # Páginas que falharam já na classificação também são falha — sem isso
+        # sumiam do relatório quando não passavam pelo Vision.
+        failed_pages = sorted(set(failed_pages) | set(classify_failed))
+
         combined_text = "\n\n".join(results)
+        text_truncated = False
+        if len(combined_text) > MAX_OUTPUT_CHARS:
+            combined_text = (
+                combined_text[:MAX_OUTPUT_CHARS]
+                + f"\n\n--- [texto truncado em {MAX_OUTPUT_CHARS} caracteres] ---"
+            )
+            text_truncated = True
+            logger.warning(f"Texto de saída truncado em {MAX_OUTPUT_CHARS} caracteres")
+
         logger.info(
             f"Concluído: {pages_with_vision} vision ok ({pages_hybrid} híbridas), "
             f"{len(failed_pages)} falharam, {pages_skipped_vision} ignoradas"
@@ -405,6 +581,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             "pages_hybrid": pages_hybrid,
             "pages_skipped_vision": pages_skipped_vision,
             "failed_pages": failed_pages,
+            "text_truncated": text_truncated,
             "text": combined_text,
             "minio_path": minio_path,
         }
@@ -461,9 +638,24 @@ def create_app():
 
     app = Flask(__name__)
 
+    # Teto de corpo HTTP. Sem isso, um POST de 1 GB de base64 existe ao mesmo
+    # tempo como bytes crus, string base64 e bytes decodificados — com 1 worker,
+    # um único request derruba o serviço inteiro por memória.
+    # base64 infla 4/3, mais folga pro resto do JSON.
+    app.config["MAX_CONTENT_LENGTH"] = (
+        math.ceil(MAX_DOWNLOAD_BYTES / 3) * 4 + 1024 * 1024
+    )
+
     # Atrás de proxy reverso (Traefik/Dokploy): respeita X-Forwarded-For
     # pra que get_remote_address devolva IP real do cliente, não do proxy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+    @app.errorhandler(HTTPException)
+    def _json_errors(e):
+        """Erro de HTTP sempre em JSON. O 413 do MAX_CONTENT_LENGTH, o 415 de
+        corpo não-JSON e os 404/405/429 saíam em HTML e quebravam o parsing do
+        n8n, que espera {"error": ...}."""
+        return jsonify({"error": e.description, "success": False}), e.code
 
     limiter = Limiter(
         get_remote_address,
@@ -520,12 +712,25 @@ def create_app():
                     return jsonify({"error": "'url' deve começar com http:// ou https://"}), 400
                 pdf_source = download_file(url)
             elif "base64" in data:
+                raw_b64 = data["base64"]
+                if not isinstance(raw_b64, str):
+                    raise ValueError("'base64' deve ser string")
+                # Checar o tamanho ANTES de decodificar: decodificar primeiro pra
+                # depois medir já teria materializado os bytes na memória.
+                if len(raw_b64) // 4 * 3 > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"base64 grande demais: excede o cap de {MAX_DOWNLOAD_BYTES} bytes"
+                    )
                 # validate=True: rejeita lixo cedo. binascii.Error herda de
                 # ValueError, então cai no handler de 400 abaixo.
                 try:
-                    pdf_source = base64.b64decode(data["base64"], validate=True)
+                    pdf_source = base64.b64decode(raw_b64, validate=True)
                 except Exception as e:
                     raise ValueError(f"base64 inválido: {e}") from e
+                if len(pdf_source) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"arquivo grande demais: {len(pdf_source)} bytes > cap {MAX_DOWNLOAD_BYTES}"
+                    )
             else:
                 return jsonify({"error": "Forneça 'url' ou 'base64'"}), 400
 

@@ -10,6 +10,10 @@ Extrai texto de PDFs de forma híbrida:
 |----------|-----------|
 | `GEMINI_API_KEY` | API key do Google Gemini |
 | `PDF_EXTRACTOR_TOKEN` | Token de autenticação para requests |
+| `ALLOWED_DOWNLOAD_HOSTS` | Opcional. Lista de hosts permitidos p/ download, separada por vírgula (ex: `z-api.io`). Vazio = desligado. Ligar fecha SSRF por redirect **e** DNS rebinding. |
+
+Demais variáveis de ajuste (limites de tamanho, páginas, render, ZIP, timeouts) estão
+documentadas no `CLAUDE.md`.
 
 ## Endpoints
 
