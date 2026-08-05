@@ -40,7 +40,9 @@ Tests live in `tests/` (pytest + pytest-mock). Gemini and `requests.get` are moc
 - Optional Minio: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_SECURE`, `MINIO_BUCKET`
 - Optional tuning: `VISION_MODEL` (default `gemini-flash-latest`), `VISION_MODEL_FALLBACK` (default `gemini-2.5-flash`), `MAX_DOWNLOAD_BYTES` (default 50 MB), `IMAGE_COVERAGE_THRESHOLD` (default 0.20), `RATE_LIMIT_DEFAULT` (default `60 per minute`), `RATE_LIMIT_EXTRACT` (default `30 per minute`)
 - Optional limits (added in the Lote A hardening — see `PRD-atualizacao-extrator.md`):
-  - `ALLOWED_DOWNLOAD_HOSTS` — comma-separated host allowlist for downloads (e.g. `z-api.io,meu-minio.exemplo.com`). Empty = disabled. **Enabling it closes both redirect-based SSRF and DNS rebinding**, since every hop must resolve to a known host.
+  - `ALLOWED_DOWNLOAD_HOSTS` — comma-separated **suffix** allowlist (e.g. `backblazeb2.com,temp-file.download`). Suffix, not full host, on purpose: Z-API serves media from `f004.backblazeb2.com`, and a bucket migration to `f005` must not break ingestion. Empty = disabled.
+  - `ALLOWED_DOWNLOAD_HOSTS_ENFORCE` (default `false`) — **two-stage rollout by design.** With the list set but enforce off, an out-of-list host only logs a WARNING and the download proceeds; a new domain becomes a log line instead of a silently lost report. Flip to `true` only after observing real traffic. Setting the list alone can never break production. **Enforcing closes both redirect-based SSRF and DNS rebinding**, since every hop must resolve to a known host.
+  - Every download logs its origin **host only** (`[origem] download de <host>`) — never the full URL, whose path carries a signed token and the patient's file id. This is what accumulates the real domain list before enforcing.
   - `MAX_REDIRECTS` (3), `DOWNLOAD_DEADLINE` (120s total, not per-socket), `DOWNLOAD_CONNECT_TIMEOUT` (10s), `DOWNLOAD_READ_TIMEOUT` (30s)
   - `MAX_RENDER_PIXELS` (20 MP), `VISION_ZOOM` (2.0), `MIN_RENDER_ZOOM` (0.25)
   - `MAX_TOTAL_PAGES` (500), `MAX_OUTPUT_CHARS` (5M)

@@ -89,7 +89,9 @@ MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
 # requests seguiria sozinho e o guard só teria visto a URL inicial — um 302 para
 # 169.254.169.254 (metadata da nuvem) ou pra rede interna passava direto.
 MAX_REDIRECTS = int(os.getenv("MAX_REDIRECTS", "3"))
-# Allowlist opcional de hosts de origem (ex: "media.z-api.io,meu-minio.exemplo.com").
+# Allowlist opcional de hosts de origem, casada por SUFIXO — "backblazeb2.com"
+# cobre f004/f005/qualquer cluster. Host cheio quebraria sozinho quando o
+# provedor migrasse de bucket.
 # Vazio = desligada (só o guard de IP privado vale). Ligar fecha redirect E DNS
 # rebinding de uma vez, porque o host precisa ser conhecido em todo hop.
 ALLOWED_DOWNLOAD_HOSTS = {
@@ -97,6 +99,12 @@ ALLOWED_DOWNLOAD_HOSTS = {
     for h in os.getenv("ALLOWED_DOWNLOAD_HOSTS", "").split(",")
     if h.strip()
 }
+# Rollout em duas etapas, de propósito: com a lista preenchida mas ENFORCE=false,
+# host fora da lista só gera WARNING e o download continua. Assim dá pra observar
+# alguns dias de tráfego real antes de recusar — se aparecer um domínio novo, ele
+# vira linha de log em vez de laudo perdido em silêncio.
+# O default é NÃO recusar: preencher a lista sozinho nunca derruba produção.
+ALLOWED_HOSTS_ENFORCE = os.getenv("ALLOWED_DOWNLOAD_HOSTS_ENFORCE", "false").lower() == "true"
 # Deadline TOTAL do download. O timeout do requests é por operação de socket: um
 # servidor que manda poucos bytes a cada N segundos segura a thread pra sempre.
 DOWNLOAD_DEADLINE = int(os.getenv("DOWNLOAD_DEADLINE", "120"))  # segundos
@@ -146,8 +154,12 @@ def setup_gemini():
 
 
 def _host_allowed(host: str) -> bool:
-    """Host bate na allowlist (match exato ou subdomínio). Allowlist vazia = tudo
-    liberado (só o guard de IP privado vale)."""
+    """Host bate na allowlist, por SUFIXO (match exato ou subdomínio).
+
+    Sufixo e não host cheio de propósito: "backblazeb2.com" cobre f004, f005 e
+    qualquer cluster futuro do provedor. Fixar o host completo quebraria sozinho
+    numa migração de bucket, sem ninguém ter mexido em nada.
+    Allowlist vazia = tudo liberado (só o guard de IP privado vale)."""
     if not ALLOWED_DOWNLOAD_HOSTS:
         return True
     host = host.lower().rstrip(".")
@@ -166,8 +178,20 @@ def _assert_safe_url(url: str) -> None:
     host = parsed.hostname
     if not host:
         raise ValueError("URL missing host")
+    # Registra o host de TODA origem usada — é isso que acumula a lista real
+    # antes de fechar a allowlist. Loga o HOST, nunca a URL inteira: o path
+    # costuma carregar token assinado e identificador do arquivo do paciente.
+    logger.info(f"[origem] download de {host}")
     if not _host_allowed(host):
-        raise ValueError(f"host not in allowlist: {host}")
+        # Modo observação (default): registra e deixa passar, pra descobrir os
+        # domínios reais sem arriscar perder laudo. Só recusa com ENFORCE=true.
+        if not ALLOWED_HOSTS_ENFORCE:
+            logger.warning(
+                f"[allowlist:observação] host fora da lista: {host} — permitido. "
+                f"Setar ALLOWED_DOWNLOAD_HOSTS_ENFORCE=true para passar a recusar."
+            )
+        else:
+            raise ValueError(f"host not in allowlist: {host}")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:

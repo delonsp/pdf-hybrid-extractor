@@ -245,7 +245,11 @@ textual — causas com tratamentos diferentes.
 allowlist) e A8 (config de infra).
 
 - [x] A1. `download_file`: `allow_redirects=False` + no máx. 3 hops revalidados, com `urljoin` para `Location` relativo e fechamento de cada resposta
-- [ ] A2. Decidir e implementar a defesa forte de SSRF: **allowlist de domínios + egress filtering** (recomendado) ou conexão ao IP validado com Host/SNI preservado — *o mecanismo já está pronto (`ALLOWED_DOWNLOAD_HOSTS`), desligado por padrão; falta confirmar os domínios do Z-API e ligar*
+- [x] A2a. Mecanismo de allowlist por **sufixo** + modo observação (`ALLOWED_DOWNLOAD_HOSTS_ENFORCE`, default `false`) e log do host de toda origem
+- [ ] A2b. Rollout: subir com a lista preenchida em **modo observação**, deixar acumular ~1 semana de tráfego real, revisar o log e só então virar `ENFORCE=true`
+  - Medido em produção em 05/08/2026 (amostra pequena: 9 URLs, 1 dia de `midia_ref`): `f004.backblazeb2.com` (7×) e `v2.temp-file.download` (2×) → sufixos `backblazeb2.com` e `temp-file.download`
+  - **Decisão consciente a registrar:** o `net_guard` do sistema de mídia deliberadamente NÃO tem allowlist (só bloqueia faixa de IP interno), pra não arriscar perder mídia de paciente. Se aqui a allowlist entrar em enforce e lá não, o mesmo domínio passa num caminho e é recusado no outro. A assimetria se justifica — este serviço **devolve o conteúdo baixado no corpo da resposta**, então um SSRF bem-sucedido aqui é primitiva de leitura direta, o que não vale para o outro caminho — mas tem que ser escolha, não acidente
+- [ ] A2c. Egress filtering na rede do Docker (complementa a allowlist; fecha o caminho mesmo se a lista falhar)
 - [x] A3. `MAX_CONTENT_LENGTH = ceil(MAX_DOWNLOAD_BYTES / 3) * 4` + margem; handler **JSON para 413**; checar tamanho do base64 **antes** de decodificar
 - [x] A4. `MAX_RENDER_PIXELS`: reescala o zoom até caber; abaixo de `MIN_RENDER_ZOOM` recusa a página (render ilegível não vale a chamada ao Gemini)
 - [x] A5. Limites de ZIP no DOCX: tamanho descomprimido, nº de entradas e taxa de compressão — mais a checagem de `word/document.xml` (item C8, feito junto por abrir o mesmo ZIP)
