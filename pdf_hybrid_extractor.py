@@ -114,6 +114,10 @@ ABORT_ON_CLIENT_DISCONNECT = os.getenv("ABORT_ON_CLIENT_DISCONNECT", "true").low
 # primário não derruba o PDF inteiro.
 VISION_MODEL = os.getenv("VISION_MODEL", "gemini-flash-latest")
 VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
+# Nível de raciocínio. NÃO setado por padrão de propósito: baixar o thinking no
+# escuro pode piorar o OCR, que é justamente o que não se quer perder. Medir com
+# `--benchmark` antes de fixar. Valores: minimal | low | medium | high.
+VISION_THINKING_LEVEL = os.getenv("VISION_THINKING_LEVEL", "").strip().lower()
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 # Redirects: seguidos manualmente pra revalidar CADA hop contra o guard anti-SSRF.
 # requests seguiria sozinho e o guard só teria visto a URL inicial — um 302 para
@@ -463,6 +467,57 @@ def _inspect_response(response) -> tuple[str, str | None]:
     return text, None
 
 
+# Qual modelo o alias resolveu de fato. Logado uma vez por processo por modelo
+# pedido: com `gemini-flash-latest` no VISION_MODEL, este log é o único jeito de
+# saber, em produção, o que a Google está servindo hoje — o alias troca a quente,
+# sem deploy e sem aviso.
+_model_version_seen: dict[str, str] = {}
+
+
+def _log_model_version(requested: str, response) -> None:
+    try:
+        served = getattr(response, "model_version", None)
+    except Exception:
+        return
+    if not served or _model_version_seen.get(requested) == served:
+        return
+    anterior = _model_version_seen.get(requested)
+    _model_version_seen[requested] = served
+    if anterior:
+        logger.warning(
+            f"[modelo] '{requested}' MUDOU de {anterior} para {served} — "
+            f"o alias foi trocado sob o serviço"
+        )
+    else:
+        logger.info(f"[modelo] '{requested}' está sendo servido por {served}")
+
+
+VALID_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
+_thinking_warned: set[str] = set()
+
+
+def _thinking_config(types):
+    """ThinkingConfig só quando explicitamente configurado — ver comentário do
+    VISION_THINKING_LEVEL.
+
+    Validação contra lista própria, NÃO contra o construtor: a SDK aceita valor
+    inválido sem levantar (só emite UserWarning e monta o enum mesmo assim), e o
+    erro só apareceria na API — em toda página, já com o tempo gasto. Um typo na
+    env do Dokploy derrubaria a extração inteira."""
+    if not VISION_THINKING_LEVEL:
+        return None
+    if VISION_THINKING_LEVEL not in VALID_THINKING_LEVELS:
+        if VISION_THINKING_LEVEL not in _thinking_warned:
+            _thinking_warned.add(VISION_THINKING_LEVEL)
+            logger.warning(
+                f"VISION_THINKING_LEVEL={VISION_THINKING_LEVEL!r} inválido "
+                f"(esperado: {sorted(VALID_THINKING_LEVELS)}) — ignorado, "
+                f"seguindo com o padrão do modelo"
+            )
+        return None
+    return types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL.upper())
+
+
 def _remaining(deadline: float | None) -> float:
     """Segundos restantes do orçamento da requisição (infinito se não há prazo)."""
     if deadline is None:
@@ -514,8 +569,10 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
                 config=types.GenerateContentConfig(
                     http_options=types.HttpOptions(timeout=call_timeout),
                     max_output_tokens=VISION_MAX_OUTPUT_TOKENS,
+                    thinking_config=_thinking_config(types),
                 ),
             )
+            _log_model_version(model_name, response)
             text, motivo = _inspect_response(response)
             if text:
                 if idx > 0:
@@ -1330,6 +1387,110 @@ def create_app():
     return app
 
 
+# === Ferramentas de calibração (C1/C2 do PRD) ===
+
+def check_models() -> None:
+    """Lista os modelos disponíveis NESTE projeto e resolve o alias.
+
+    Existe porque a escolha do pin não dá pra fazer de fora: o catálogo depende
+    do projeto/billing, e o que `gemini-flash-latest` resolve muda a quente."""
+    client = setup_gemini()
+    print("Modelos com generateContent disponíveis neste projeto:\n")
+    try:
+        for m in client.models.list():
+            acoes = getattr(m, "supported_actions", None) or []
+            if acoes and "generateContent" not in acoes:
+                continue
+            nome = (m.name or "").replace("models/", "")
+            if "flash" in nome or "pro" in nome:
+                print(f"  {nome}")
+    except Exception as e:
+        print(f"  (falhou ao listar: {e})")
+
+    print(f"\nResolvendo o alias configurado em VISION_MODEL ({VISION_MODEL})...")
+    from google.genai import types
+    try:
+        r = client.models.generate_content(
+            model=VISION_MODEL,
+            contents=["responda apenas: ok"],
+            config=types.GenerateContentConfig(max_output_tokens=2048),
+        )
+        print(f"  '{VISION_MODEL}' → servido por: {getattr(r, 'model_version', '?')}")
+        print("\n  É ESSE o ID que deve ir no VISION_MODEL para encerrar o alias.")
+    except Exception as e:
+        print(f"  falhou: {e}")
+
+
+def benchmark(pdf_path: str, modelos: list[str], niveis: list[str]) -> None:
+    """Compara modelos e níveis de thinking numa página real.
+
+    Mede o que decide o C2: tokens de raciocínio (custo e latência escondidos),
+    tempo de parede e tamanho da transcrição. A QUALIDADE do texto quem julga é
+    o médico — por isso o texto de cada combinação é gravado em arquivo.
+
+    ATENÇÃO: manda a página para a nuvem. Use documento anonimizado
+    (`~/scripts/anonimizar_prontuario.py`) ou um laudo seu, nunca de paciente
+    identificado."""
+    import json
+    from google.genai import types
+
+    doc = _open_pdf(Path(pdf_path).read_bytes())
+    try:
+        img = _render_page_png(doc, 0)
+    finally:
+        _close_pdf(doc)
+    print(f"Página 1 de {pdf_path} renderizada ({len(img) // 1024} KB)\n")
+
+    client = setup_gemini()
+    prompt = _build_vision_prompt()
+    saida = Path("benchmark-vision")
+    saida.mkdir(exist_ok=True)
+    linhas = []
+
+    for modelo in modelos:
+        for nivel in niveis:
+            cfg = {"max_output_tokens": VISION_MAX_OUTPUT_TOKENS}
+            if nivel != "default":
+                try:
+                    cfg["thinking_config"] = types.ThinkingConfig(
+                        thinking_level=nivel.upper())
+                except Exception as e:
+                    print(f"  {modelo} / {nivel}: nível inválido ({e})")
+                    continue
+            t0 = time.monotonic()
+            try:
+                r = client.models.generate_content(
+                    model=modelo,
+                    contents=[prompt, types.Part.from_bytes(
+                        data=img, mime_type="image/png")],
+                    config=types.GenerateContentConfig(**cfg),
+                )
+                dt = time.monotonic() - t0
+                texto, motivo = _inspect_response(r)
+                u = getattr(r, "usage_metadata", None)
+                pensados = getattr(u, "thoughts_token_count", None) or 0
+                saidos = getattr(u, "candidates_token_count", None) or 0
+                servido = getattr(r, "model_version", "?")
+                arq = saida / f"{modelo.replace('/', '_')}__{nivel}.txt"
+                arq.write_text(texto or "")
+                linhas.append({
+                    "modelo": modelo, "nivel": nivel, "servido": servido,
+                    "segundos": round(dt, 1), "tokens_raciocinio": pensados,
+                    "tokens_saida": saidos, "chars": len(texto or ""),
+                    "motivo": motivo, "arquivo": str(arq),
+                })
+                print(f"  {modelo:28} {nivel:8} {dt:6.1f}s  "
+                      f"raciocínio={pensados:6}  saída={saidos:6}  "
+                      f"chars={len(texto or ''):6}  {motivo or ''}")
+            except Exception as e:
+                print(f"  {modelo:28} {nivel:8} FALHOU: {e}")
+
+    (saida / "resumo.json").write_text(json.dumps(linhas, indent=2, ensure_ascii=False))
+    print(f"\nTextos e resumo.json em {saida}/")
+    print("Compare os textos ANTES de fixar o nível: menos raciocínio é mais")
+    print("barato e mais rápido, mas só serve se a transcrição não piorar.")
+
+
 # === CLI ===
 
 def main():
@@ -1338,10 +1499,26 @@ def main():
     parser.add_argument("--serve", action="store_true", help="Rodar como servidor Flask")
     parser.add_argument("--port", type=int, default=5050, help="Porta do servidor")
     parser.add_argument("--host", default="0.0.0.0", help="Host do servidor")
-    
+    parser.add_argument("--check-models", action="store_true",
+                        help="Lista modelos do projeto e resolve o alias do VISION_MODEL")
+    parser.add_argument("--benchmark", metavar="PDF",
+                        help="Compara modelos/thinking numa página (use PDF anonimizado)")
+    parser.add_argument("--models", default=f"{VISION_MODEL},{VISION_MODEL_FALLBACK}",
+                        help="Modelos do benchmark, separados por vírgula")
+    parser.add_argument("--levels", default="default,minimal,low,high",
+                        help="Níveis de thinking do benchmark, separados por vírgula")
+
     args = parser.parse_args()
-    
-    if args.serve:
+
+    if args.check_models:
+        check_models()
+    elif args.benchmark:
+        benchmark(
+            args.benchmark,
+            [m.strip() for m in args.models.split(",") if m.strip()],
+            [n.strip() for n in args.levels.split(",") if n.strip()],
+        )
+    elif args.serve:
         app = create_app()
         print(f"🚀 Servidor rodando em http://{args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=False)

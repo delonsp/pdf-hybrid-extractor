@@ -74,7 +74,22 @@ Pipeline in `process_pdf()`:
    - `--- Página N (texto + Vision AI) ---` (hybrid success — text + Vision concatenated)
    - `--- Página N (Vision AI falhou ...) ---` / `(imagem ignorada - cap atingido ...)` for failures or cap.
 
-Vision model: `gemini-2.5-flash` (set at `VISION_MODEL`). When changing models, sanity-check the SDK still accepts `types.Part.from_bytes(..., mime_type="image/png")` and that `response.text` shape is unchanged — newer models sometimes shift candidate handling.
+### Model pinning and thinking level
+
+`VISION_MODEL` defaults to `gemini-flash-latest`, **an alias Google hot-swaps** — behaviour, latency and cost can change with no deploy and no notice. Two things are calibrated against whatever it resolves to *today*: the transcription prompt and `VISION_MAX_OUTPUT_TOKENS`. Pinning is one env var, but **the right value cannot be chosen from outside**: the model catalogue depends on the project/billing.
+
+```bash
+python3 pdf_hybrid_extractor.py --check-models     # lists this project's models, resolves the alias
+python3 pdf_hybrid_extractor.py --benchmark laudo-anonimizado.pdf
+```
+
+`--benchmark` renders page 1 and runs it across models × thinking levels, reporting thinking tokens, wall time and output length, and writing each transcription to `benchmark-vision/` so the text can be compared. **It sends the page to the cloud — use an anonymised document, never an identified patient's.**
+
+Every Vision call logs which model actually served it (`[modelo] '<requested>' está sendo servido por <served>`), once per process, and logs a **WARNING if that changes mid-life** — that is the alias moving under the service, and in production it is the only way to see it happen.
+
+`VISION_THINKING_LEVEL` (`minimal|low|medium|high`) is **deliberately unset by default**: lowering thinking is cheaper and faster but can degrade OCR, which is the one thing not worth losing. Measure with `--benchmark`, then set it. The value is validated against an internal list rather than the SDK constructor — the SDK accepts an invalid level without raising (it only emits a `UserWarning` and builds the enum anyway), so a typo would reach the API and fail every page after the time was already spent.
+
+When changing models, sanity-check the SDK still accepts `types.Part.from_bytes(..., mime_type="image/png")` and that `response.text` shape is unchanged — newer models sometimes shift candidate handling.
 
 DOCX path (Flask route only, not `process_pdf`): `_detect_type()` peeks magic bytes (`%PDF` vs `PK\x03\x04`); DOCX bytes go straight to `extract_text_docx` (mammoth). Caller can override with `type: "pdf"|"docx"` in the body.
 

@@ -381,8 +381,8 @@ allowlist) e A8 (config de infra).
 
 ### Lote C — Modelo, dependências, API (P1/P2)
 
-- [ ] C1. Pinar `VISION_MODEL` em ID explícito (fim do alias)
-- [ ] C2. Medir thinking numa amostra anonimizada (`thoughts_token_count`, qualidade do OCR) e **só então** fixar o nível
+- [~] C1. Pinar `VISION_MODEL` em ID explícito (fim do alias). **Ferramenta pronta, valor pendente:** o catálogo de modelos depende do projeto/billing, então o ID certo não dá pra escolher de fora. `--check-models` lista os modelos do projeto e resolve o alias em um comando. Enquanto não for pinado, todo call loga qual modelo atendeu de fato, e uma troca de alias vira WARNING — o evento fica visível em vez de silencioso
+- [~] C2. Medir thinking numa amostra anonimizada e **só então** fixar o nível. **Harness pronto:** `--benchmark <pdf>` roda modelos × níveis numa página real, reporta tokens de raciocínio, tempo e tamanho, e grava cada transcrição em `benchmark-vision/` para comparação. `VISION_THINKING_LEVEL` segue **não setado** de propósito — a medição é que decide. Falta rodar com um laudo anonimizado
 - [ ] C3. Retry **depois** do deadline existir (B3): respeitar `Retry-After`, orçamento total de tentativas somando primário + fallback. *(Nota: verifiquei em `_api_client.py:531` que `retry_args(None)` devolve `stop_after_attempt(1)` — a SDK **não** repete sozinha. `MAX_RETRY_COUNT=3` só vale para upload de arquivo.)*
 - [ ] C4. Lock completo: versões exatas **com transitivas e hashes**, e imagem Docker pinada por **digest** — ⚠ pinar só os diretos não torna o build reprodutível
 - [ ] C5. Congelar o conjunto atual primeiro; upgrades (PyMuPDF 1.28, google-genai 2.16, flask 3.1.3, flask-limiter 4.x, gunicorn 26.x) em **PR separado**, um por vez
