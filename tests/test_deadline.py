@@ -170,3 +170,67 @@ class TestAdmissionControl:
         assert r.status_code == 500
         assert pdfx._extract_slots.acquire(blocking=False), "slot vazou"
         pdfx._extract_slots.release()
+
+
+class TestEsperaNaFila:
+    """O REQUEST_DEADLINE começa quando o handler roda, não quando a requisição
+    chega. Se ela esperou no backlog, esse tempo saiu do orçamento do CHAMADOR
+    sem sair do nosso — e o timeout dele estoura com a gente 'dentro do prazo'."""
+
+    def test_sem_header_comportamento_antigo(self, app):
+        with app.test_request_context("/extract"):
+            assert pdfx._fila_esperada() == 0.0
+
+    def test_desconta_espera_informada(self, app):
+        with app.test_request_context(
+                "/extract", headers={"X-Request-Start": str(time.time() - 30)}):
+            assert 29 <= pdfx._fila_esperada() <= 32
+
+    def test_aceita_milissegundos(self, app):
+        with app.test_request_context(
+                "/extract", headers={"X-Request-Start": str(int((time.time() - 20) * 1000))}):
+            assert 19 <= pdfx._fila_esperada() <= 22
+
+    def test_aceita_prefixo_t(self, app):
+        with app.test_request_context(
+                "/extract", headers={"X-Request-Start": f"t={time.time() - 10}"}):
+            assert 9 <= pdfx._fila_esperada() <= 12
+
+    def test_valor_futuro_e_ignorado(self, app):
+        """Relógios de máquinas diferentes não são confiáveis; skew não pode
+        fazer a gente recusar tudo."""
+        with app.test_request_context(
+                "/extract", headers={"X-Request-Start": str(time.time() + 500)}):
+            assert pdfx._fila_esperada() == 0.0
+
+    def test_valor_absurdo_e_ignorado(self, app):
+        with app.test_request_context("/extract", headers={"X-Request-Start": "1"}):
+            assert pdfx._fila_esperada() == 0.0
+
+    def test_lixo_e_ignorado(self, app):
+        with app.test_request_context("/extract", headers={"X-Request-Start": "ontem"}):
+            assert pdfx._fila_esperada() == 0.0
+
+    def test_espera_longa_devolve_503_em_vez_de_trabalho_orfao(self, client, auth_header):
+        """Sem prazo útil sobrando, começar seria trabalho garantidamente
+        descartado ocupando thread viva."""
+        r = client.post("/extract", json={"base64": "aGk="},
+                        headers={**auth_header,
+                                 "X-Request-Start": str(time.time() - pdfx.REQUEST_DEADLINE)})
+        assert r.status_code == 503
+        assert r.headers["Retry-After"] == str(pdfx.RETRY_AFTER_SECONDS)
+
+
+class TestInvarianteDeCapacidade:
+    def test_semaforo_menor_que_threads(self):
+        """A folga é o que garante /health e 503 rápido. Se isto quebrar num
+        ajuste de env, o serviço perde as duas garantias em silêncio."""
+        assert pdfx.MAX_CONCURRENT_EXTRACTIONS < pdfx.GUNICORN_THREADS
+
+    def test_configuracao_invalida_loga_erro(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setattr(pdfx, "MAX_CONCURRENT_EXTRACTIONS", 8)
+        monkeypatch.setattr(pdfx, "GUNICORN_THREADS", 8)
+        with caplog.at_level(logging.ERROR):
+            pdfx.create_app()
+        assert any("CONFIGURAÇÃO INVÁLIDA" in r.message for r in caplog.records)

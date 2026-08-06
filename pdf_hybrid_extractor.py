@@ -106,8 +106,25 @@ VISION_START_MIN_BUDGET = int(os.getenv("VISION_START_MIN_BUDGET", "0"))
 # Admission control: menor que o nº de threads do gunicorn de propósito, pra
 # sempre sobrar thread para o /health e para devolver 503 rápido. Enfileirar não
 # ajuda — a espera sai do mesmo orçamento de 120s do chamador.
-MAX_CONCURRENT_EXTRACTIONS = int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "3"))
+# Vagas de extração simultânea. INVARIANTE: tem que ser MENOR que o número de
+# threads do gunicorn — a folga é o que garante o /health respondendo e o 503
+# rápido. Subir só isto empurraria o excedente pro backlog e mataria as duas
+# garantias. Medido em 06/08/2026 (PDF de 5 páginas tipo scan, pico de RSS):
+#   3 vagas × VISION_PARALLEL 3 →  9 chamadas ao Gemini, 310 MB
+#   6 vagas × VISION_PARALLEL 3 → 18 chamadas, 460 MB
+#   6 vagas × VISION_PARALLEL 2 → 12 chamadas, 392 MB
+# Se a memória apertar, baixar VISION_PARALLEL rende mais que baixar as vagas:
+# troca latência de um documento por vazão do lote, que é o certo para rajada.
+MAX_CONCURRENT_EXTRACTIONS = int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "6"))
+GUNICORN_THREADS = int(os.getenv("GUNICORN_THREADS", "8"))
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "30"))
+# O REQUEST_DEADLINE começa quando o handler roda, não quando a requisição chega.
+# Se ela esperou no backlog, esse tempo saiu do orçamento do CHAMADOR sem sair do
+# nosso — e o timeout estoura do lado dele com a gente ainda "dentro do prazo".
+# Se o chamador mandar X-Request-Start, a espera é descontada. Sem o header, o
+# comportamento é o de antes.
+TRUST_REQUEST_START = os.getenv("TRUST_REQUEST_START", "true").lower() == "true"
+MAX_PLAUSIBLE_QUEUE_WAIT = int(os.getenv("MAX_PLAUSIBLE_QUEUE_WAIT", "600"))
 # Quantos proxies confiar no X-Forwarded-For. Tem que bater com a cadeia REAL do
 # Dokploy: confiar em mais hops do que existem deixa o cliente forjar o IP que o
 # rate limit enxerga; confiar em menos faz o limite valer pro IP do proxy, ou
@@ -159,8 +176,11 @@ DOWNLOAD_DEADLINE = int(os.getenv("DOWNLOAD_DEADLINE", "120"))  # segundos
 DOWNLOAD_CONNECT_TIMEOUT = int(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "10"))
 DOWNLOAD_READ_TIMEOUT = int(os.getenv("DOWNLOAD_READ_TIMEOUT", "30"))
 # Teto de rasterização. Nem o cap de bytes nem o de páginas protege disso: um PDF
-# de poucos KB com MediaBox gigante faz o get_pixmap alocar GB — × VISION_PARALLEL.
-# Pixmap RGB gasta ~3 bytes/pixel, então 20 MP ≈ 60 MB por página em voo.
+# de poucos KB com MediaBox gigante faz o get_pixmap alocar GB.
+# Pixmap RGB gasta ~3 bytes/pixel, então 20 MP ≈ 60 MB.
+# NÃO multiplica por concorrência: desde o B2, _pymupdf_lock serializa o render
+# no processo inteiro, então existe UM pixmap por vez. O que escala com a
+# concorrência são os PNGs retidos (bem menores) e os bytes do PDF em memória.
 MAX_RENDER_PIXELS = int(os.getenv("MAX_RENDER_PIXELS", str(20_000_000)))
 VISION_ZOOM = float(os.getenv("VISION_ZOOM", "2.0"))
 MIN_RENDER_ZOOM = float(os.getenv("MIN_RENDER_ZOOM", "0.25"))
@@ -1297,6 +1317,36 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> tupl
 _extract_slots = threading.BoundedSemaphore(MAX_CONCURRENT_EXTRACTIONS)
 
 
+def _fila_esperada() -> float:
+    """Quantos segundos a requisição passou na fila antes de chegar ao handler.
+
+    Lido de X-Request-Start (epoch em segundos ou milissegundos, com ou sem o
+    prefixo `t=` que alguns proxies usam). Descartado se o valor for implausível
+    — relógio de máquinas diferentes não é confiável, e um skew faria a gente
+    recusar tudo ou dar prazo demais."""
+    if not TRUST_REQUEST_START:
+        return 0.0
+    bruto = request.headers.get("X-Request-Start", "").strip()
+    if not bruto:
+        return 0.0
+    if bruto.startswith("t="):
+        bruto = bruto[2:]
+    try:
+        valor = float(bruto)
+    except ValueError:
+        return 0.0
+    if valor > 1e11:      # veio em milissegundos
+        valor /= 1000.0
+    espera = time.time() - valor
+    if espera < 0 or espera > MAX_PLAUSIBLE_QUEUE_WAIT:
+        logger.warning(
+            f"X-Request-Start implausível ({espera:.0f}s) — ignorado, "
+            f"provável relógio dessincronizado"
+        )
+        return 0.0
+    return espera
+
+
 def _make_cancel_check():
     """Callable que diz se o chamador foi embora, ou None se não dá pra saber.
 
@@ -1353,6 +1403,16 @@ def create_app():
         corpo não-JSON e os 404/405/429 saíam em HTML e quebravam o parsing do
         n8n, que espera {"error": ...}."""
         return jsonify({"error": e.description, "success": False}), e.code
+
+    # A invariante que sustenta o /health e o 503 rápido: sempre sobrar thread
+    # livre. Deixar isso implícito é como ele se perde num ajuste de env.
+    if MAX_CONCURRENT_EXTRACTIONS >= GUNICORN_THREADS:
+        logger.error(
+            f"CONFIGURAÇÃO INVÁLIDA: MAX_CONCURRENT_EXTRACTIONS "
+            f"({MAX_CONCURRENT_EXTRACTIONS}) >= GUNICORN_THREADS "
+            f"({GUNICORN_THREADS}). Sem folga, /health pode não responder e o "
+            f"excedente vai pro backlog em vez de tomar 503 rápido."
+        )
 
     limiter = Limiter(
         get_remote_address,
@@ -1423,7 +1483,24 @@ def create_app():
         # acquire e o finally vazaria o slot PARA SEMPRE, e o serviço se
         # estrangularia sozinho sem nunca voltar.
         try:
-            deadline = time.monotonic() + REQUEST_DEADLINE
+                # Desconta o tempo que a requisição passou na fila: ele saiu do
+            # orçamento do chamador, mesmo não tendo saído do nosso.
+            espera = _fila_esperada()
+            orcamento = REQUEST_DEADLINE - espera
+            if espera and orcamento < FALLBACK_MIN_BUDGET:
+                # Não sobra prazo útil: começar seria trabalho órfão garantido.
+                logger.warning(
+                    f"Requisição esperou {espera:.0f}s na fila — sobram "
+                    f"{orcamento:.0f}s, não vale começar"
+                )
+                return jsonify({
+                    "error": "servidor congestionado, tente novamente",
+                    "success": False,
+                }), 503, {"Retry-After": str(RETRY_AFTER_SECONDS)}
+            if espera:
+                logger.info(f"Requisição esperou {espera:.0f}s na fila; "
+                            f"orçamento reduzido para {orcamento:.0f}s")
+            deadline = time.monotonic() + orcamento
             cancel_check = _make_cancel_check()
 
             # Obtém PDF — URL deve ser http/https; download_file aplica guarda anti-SSRF

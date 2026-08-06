@@ -39,4 +39,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # --backlog 32: com o default (2048) o kernel aceitaria milhares de conexões que
 # ficariam esperando muito além dos 120s que o chamador aguarda. Fila curta +
 # 503 com Retry-After da aplicação é melhor que timeout lento e silencioso.
-CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "1", "--threads", "4", "--worker-class", "gthread", "--backlog", "32", "--timeout", "480", "pdf_hybrid_extractor:create_app()"]
+# --threads vem de env pra ser ajustável no Dokploy sem rebuild. INVARIANTE:
+# MAX_CONCURRENT_EXTRACTIONS tem que ser MENOR que isto — a folga é o que garante
+# o /health respondendo e o 503 rápido. A aplicação valida e loga erro se furar.
+# `exec` na forma shell: sem ele o gunicorn viraria filho do sh e não receberia
+# os sinais de parada do Docker.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:5050 --workers 1 --threads ${GUNICORN_THREADS:-8} --worker-class gthread --backlog 32 --timeout 480 'pdf_hybrid_extractor:create_app()'"]
