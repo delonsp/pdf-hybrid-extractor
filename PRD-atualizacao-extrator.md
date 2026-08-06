@@ -270,6 +270,119 @@ incompleto que antes teria sido gravado como completo.
 
 ---
 
+### 4.4d · Incidente de campo confirmando a cauda (06/08/2026 14:40 BRT)
+
+Escrito pela sessão do `webhook-pacientes`, com os dados do lado do chamador.
+
+**O que aconteceu.** Um paciente enviou **34 PDFs em ~3 minutos** (relatórios e exames feitos
+em Portugal — radiologia, laboratório). Resultado no chamador:
+
+| | |
+|---|---|
+| Extraídos | **8** |
+| Recusados | **26** |
+| Janela das recusas | 14:40:12 → 14:40:43 |
+| Pico | **23 recusas em 1,6 segundo** |
+
+A linha do tempo mata a hipótese de queda: às 14:40:19–14:40:33 o serviço estava extraindo
+normalmente (6 sucessos), e 8 segundos depois vieram 23 recusas em 1,6s. **Rejeição instantânea
+com o serviço vivo** é a assinatura do admission control, não de timeout (que levaria 120s) nem
+de indisponibilidade.
+
+É exatamente o cenário previsto no §4.4c — a cauda, não a vazão. Com 3 vagas, bastaram alguns
+documentos densos simultâneos para todo o resto tomar 503.
+
+**Isto NÃO é um pedido: `a1a7b21` (14:32) já resolve.** O commit é 8 minutos *anterior* ao
+incidente, então a hipótese de trabalho é que ainda não estava em produção às 14:40. **Ação
+sugerida: confirmar que o deploy de `a1a7b21` está no ar** — se estiver e a recusa em rajada
+voltar com 6 vagas, o diagnóstico muda de figura e vale reabrir.
+
+**Impacto real: nenhum laudo perdido.** Os 26 tinham a URL da mídia gravada e foram
+reprocessados pelo `/trigger/resgate`; os 34 documentos estão íntegros no prontuário. O custo
+foi operacional (intervenção manual), não clínico.
+
+#### O que o incidente expôs do lado do chamador
+
+O incidente não achou defeito neste serviço, mas achou **três** no webhook — todos já corrigidos.
+Vale registrar um deles porque muda como interpretar métricas daqui:
+
+O resgate restaurava o texto do laudo mas **não reclassificava** o documento. O laudo voltava ao
+banco correto e mesmo assim não entrava na seção de exames da revisão médica. Eram **15 dos 26**.
+Ou seja: durante algumas horas o sistema reportou `recuperados: 26` enquanto 15 laudos seguiam
+invisíveis para o médico. **Número de sucesso não é evidência de sucesso** — o mesmo ceticismo
+vale para os contadores deste serviço.
+
+#### Pendência recíproca: `X-Request-Start`
+
+O `a1a7b21` implementa o desconto da espera na fila, mas o mecanismo **depende do chamador enviar
+o cabeçalho**. **Já resolvido** — o webhook passou a carimbar (`5729670`, no ar em 06/08).
+
+Duas decisões do lado de lá que importam para quem for ler o `_fila_esperada()`:
+
+- **Carimbo por TENTATIVA**, não por chamada. Herdar o carimbo faria a repetição pós-503 parecer
+  30s de fila e ser recusada de saída por "sem prazo útil sobrando" — justamente quando a espera
+  foi deliberada, obedecendo ao `Retry-After` de vocês.
+- **Truncado, não arredondado.** `f"{time.time():.3f}"` arredonda para cima e devolve um instante
+  no futuro; a conta de vocês é `time.time() - carimbo` e o guard `espera < 0` descartaria o
+  valor como relógio dessincronizado. O desconto morreria em silêncio — sem erro, só sem efeito —
+  por meio milissegundo. Vale o alerta porque qualquer outro chamador que vocês integrem vai
+  escrever `:.3f` por reflexo e cair nisso.
+
+---
+
+#### ⚠ Correção do relatório acima — verificado nos logs do extrator (06/08/2026)
+
+Três correções, e a primeira inverte a conclusão.
+
+**1. `a1a7b21` JÁ ESTAVA no ar durante o incidente.** O relatório supôs que não, porque o commit
+é de 14:32 e o incidente de 14:40. Mas **o relógio do servidor está ~61s atrasado** em relação às
+máquinas de desenvolvimento, o que desloca toda leitura de horário feita lá. Corrigido:
+
+| evento | hora real (BRT) |
+|---|---|
+| commit `a1a7b21` | 14:32:17 |
+| container do extrator sobe com esse código | ~14:32:26 |
+| incidente | 14:40:10 → 14:40:42 |
+
+Confirmado dentro do container: `--threads 8`, `MAX_CONCURRENT_EXTRACTIONS = 6`,
+`VISION_MODEL = gemini-3.6-flash`. **As recusas aconteceram com 6 vagas, não com 3.** Pelo próprio
+critério do relatório ("se estiver e a recusa em rajada voltar com 6 vagas, o diagnóstico muda de
+figura"), o item está **reaberto**.
+
+**2. Foram DUAS causas, não uma — e a que mais recusou não é a que o relatório identificou.**
+Contagem no log, janela 17:38–17:43 UTC do servidor:
+
+| causa | recusas | código |
+|---|---|---|
+| `Capacidade cheia (6 extrações em voo)` | 23 | 503 |
+| `ratelimit 30 per 1 minute (10.0.1.12) exceeded` | **26** | **429** |
+| extrações concluídas | 7 | 200 |
+
+O `RATE_LIMIT_EXTRACT` (default `30 per minute`, por IP) recusou **mais** que o admission control.
+E o webhook é **um único IP** (`10.0.1.12`), então o limite por IP é, na prática, um limite global
+do caminho principal. A assinatura de "rejeição instantânea com serviço vivo" que o relatório
+atribuiu ao admission control descreve os dois igualmente.
+
+**3. O limite estava ABAIXO da própria capacidade do serviço.** Com 6 vagas e p50 de 4,5s, a vazão
+é ~80/min; o limiter cortava em 30/min. Ele não estava protegendo nada — estava **jogando fora
+trabalho que o serviço daria conta de fazer**. Era resíduo de quando o admission control não
+existia: naquela época o limiter era o único controle; hoje é backstop contra token vazado ou loop
+desgovernado. Default subiu para `300 per minute`.
+
+**Sobre o ceticismo com contadores.** O relatório registra, do lado de lá, que `recuperados: 26`
+convivia com 15 laudos invisíveis, e conclui que número de sucesso não é evidência de sucesso.
+Vale para os dois lados: aqui, o número de "recusas" de um lado só bateu com o do outro depois de
+separar 503 de 429 e considerar que o retry do webhook faz um documento aparecer em dois eventos.
+
+**Ação, agora do lado de cá:** `RATE_LIMIT_EXTRACT` de 30 → 300/min. O `X-Request-Start` segue
+pendente do lado do webhook, e continua valendo.
+
+**Ação de infraestrutura:** sincronizar o relógio do servidor. O desvio de ~61s não é grande, mas
+foi o suficiente para inverter a ordem de dois eventos e produzir um diagnóstico errado — e vai
+repetir isso em toda correlação de log entre as duas pontas.
+
+---
+
 ### 4.5 · P1-6 — O prompt pede interpretação clínica
 
 `VISION_PROMPT` (`:92`) termina com: *"Se for uma imagem de exame (ultrassom, raio-x, etc),

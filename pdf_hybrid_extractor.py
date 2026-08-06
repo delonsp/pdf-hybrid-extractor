@@ -1425,8 +1425,15 @@ def create_app():
     def health():
         return jsonify({"status": "ok"})
 
+    # O rate limit é BACKSTOP contra token vazado ou loop desgovernado — não é
+    # controle de vazão. Quem controla vazão é o admission control, que não
+    # existia quando este limite foi escrito.
+    # 30/min ficou ABAIXO da capacidade real do serviço (6 vagas ÷ p50 de 4,5s
+    # ≈ 80/min) e virou o gargalo: em 06/08/2026 recusou 26 requisições numa
+    # rajada de 34 documentos de um paciente, MAIS do que o próprio admission
+    # control recusou (23). Estava jogando fora trabalho que o serviço fazia.
     @app.route("/extract", methods=["POST"])
-    @limiter.limit(os.getenv("RATE_LIMIT_EXTRACT", "30 per minute"))
+    @limiter.limit(os.getenv("RATE_LIMIT_EXTRACT", "300 per minute"))
     def extract():
         """
         Endpoint para extrair texto de PDF.
