@@ -26,12 +26,16 @@ class _FakeS3Error(Exception):
 
 
 class _FakeMinio:
-    def __init__(self, *a, existe=True, erro_no_put=None, erro_no_make=None, **kw):
+    def __init__(self, *a, existe=True, erro_no_put=None, erro_no_make=None,
+                 lifecycle=None, erro_no_lifecycle=None, **kw):
         self.existe = existe
         self.erro_no_put = erro_no_put
         self.erro_no_make = erro_no_make
         self.objetos = []
         self.buckets_criados = []
+        self.lifecycle = lifecycle
+        self.erro_no_lifecycle = erro_no_lifecycle
+        self.lifecycles_aplicados = []
 
     def bucket_exists(self, bucket):
         return self.existe
@@ -41,10 +45,27 @@ class _FakeMinio:
             raise self.erro_no_make
         self.buckets_criados.append(bucket)
 
+    def get_bucket_lifecycle(self, bucket):
+        return self.lifecycle
+
+    def set_bucket_lifecycle(self, bucket, config):
+        if self.erro_no_lifecycle:
+            raise self.erro_no_lifecycle
+        self.lifecycles_aplicados.append((bucket, config))
+        self.lifecycle = config
+
     def put_object(self, bucket, name, data, length, content_type=None):
         if self.erro_no_put:
             raise self.erro_no_put
         self.objetos.append((bucket, name, length))
+
+
+@pytest.fixture(autouse=True)
+def _reset_retencao():
+    """Cache de retenção é por processo — limpar entre testes."""
+    pdfx._retention_applied.clear()
+    yield
+    pdfx._retention_applied.clear()
 
 
 def _patch_minio(mocker, fake):
@@ -155,3 +176,79 @@ class TestGravaDepoisDeValidar:
         r = pdfx.process_pdf(pdf)
         assert r["minio_stored"] is None
         assert r["minio_error"] is None
+
+
+class TestRetencao:
+    """O bucket é área de trabalho para interpretação, não repositório eterno
+    de exames. Quem apaga é o Minio, via regra de lifecycle."""
+
+    def test_aplica_expiracao_no_bucket(self, mocker, monkeypatch):
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 60)
+        fake = _patch_minio(mocker, _FakeMinio())
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+
+        assert len(fake.lifecycles_aplicados) == 1
+        _, config = fake.lifecycles_aplicados[0]
+        regra = config.rules[0]
+        assert regra.expiration.days == 60
+        assert regra.rule_id == pdfx.RETENTION_RULE_ID
+
+    def test_aplica_uma_vez_por_processo(self, mocker, monkeypatch):
+        """Não faz sentido reconfigurar o bucket a cada upload."""
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 60)
+        fake = _patch_minio(mocker, _FakeMinio())
+        for _ in range(3):
+            pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert len(fake.lifecycles_aplicados) == 1
+        assert len(fake.objetos) == 3
+
+    def test_desligado_nao_toca_no_bucket(self, mocker, monkeypatch):
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 0)
+        fake = _patch_minio(mocker, _FakeMinio())
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert fake.lifecycles_aplicados == []
+
+    def test_falha_na_retencao_nao_derruba_o_upload(self, mocker, monkeypatch):
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 60)
+        fake = _patch_minio(mocker, _FakeMinio(
+            erro_no_lifecycle=RuntimeError("sem permissão")))
+        caminho, erro = pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert caminho is not None, "upload foi perdido por causa da retenção"
+        assert erro is None
+
+    def test_falha_na_retencao_tenta_de_novo(self, mocker, monkeypatch):
+        """Não pode marcar como aplicada em falha: o bucket ficaria acumulando
+        sem prazo até o próximo restart, e ninguém perceberia."""
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 60)
+        fake = _patch_minio(mocker, _FakeMinio(
+            erro_no_lifecycle=RuntimeError("sem permissão")))
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert CONFIG["bucket"] not in pdfx._retention_applied
+
+        fake.erro_no_lifecycle = None
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert len(fake.lifecycles_aplicados) == 1
+
+    def test_regra_ja_correta_nao_e_reescrita(self, mocker, monkeypatch):
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 60)
+        from minio.lifecycleconfig import LifecycleConfig, Rule, Expiration
+        from minio.commonconfig import ENABLED, Filter
+        atual = LifecycleConfig([Rule(
+            ENABLED, rule_id=pdfx.RETENTION_RULE_ID,
+            rule_filter=Filter(prefix=""), expiration=Expiration(days=60),
+        )])
+        fake = _patch_minio(mocker, _FakeMinio(lifecycle=atual))
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert fake.lifecycles_aplicados == []
+
+    def test_prazo_alterado_reescreve_a_regra(self, mocker, monkeypatch):
+        monkeypatch.setattr(pdfx, "MINIO_RETENTION_DAYS", 30)
+        from minio.lifecycleconfig import LifecycleConfig, Rule, Expiration
+        from minio.commonconfig import ENABLED, Filter
+        antiga = LifecycleConfig([Rule(
+            ENABLED, rule_id=pdfx.RETENTION_RULE_ID,
+            rule_filter=Filter(prefix=""), expiration=Expiration(days=60),
+        )])
+        fake = _patch_minio(mocker, _FakeMinio(lifecycle=antiga))
+        pdfx.save_to_minio_storage(b"%PDF-1.4", "5511999998888", CONFIG)
+        assert fake.lifecycles_aplicados[0][1].rules[0].expiration.days == 30

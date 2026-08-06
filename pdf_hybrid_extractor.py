@@ -157,6 +157,13 @@ MAX_ZIP_ENTRIES = int(os.getenv("MAX_ZIP_ENTRIES", "2000"))
 # quebra busca por prefixo nos objetos já gravados. É decisão de migração.
 MINIO_KEY_MODE = os.getenv("MINIO_KEY_MODE", "telefone").lower()
 MINIO_KEY_SALT = os.getenv("MINIO_KEY_SALT", "")
+# Retenção. O bucket é área de trabalho para interpretação, NÃO repositório de
+# exames — decisão do Dr. Alain em 06/08/2026: apagar após 2 meses.
+# Vira regra de lifecycle no bucket; quem apaga é o próprio Minio.
+# ATENÇÃO: a regra vale para o bucket inteiro, inclusive objetos JÁ existentes.
+# Ao ligar, tudo que já passou do prazo é apagado na primeira varredura, e isso
+# não tem volta. 0 = desligado (acumula para sempre).
+MINIO_RETENTION_DAYS = int(os.getenv("MINIO_RETENTION_DAYS", "60"))
 MAX_COMPRESSION_RATIO = float(os.getenv("MAX_COMPRESSION_RATIO", "200"))
 ALLOWED_DOWNLOAD_TYPES = {
     "application/pdf",
@@ -985,6 +992,68 @@ def _minio_prefix(telefone: str) -> str:
     return digest.hexdigest()[:32]
 
 
+# Aplicar a regra de retenção uma vez por processo, não a cada request.
+# Se falhar, NÃO marca como feito — senão a retenção sumiria em silêncio até o
+# próximo restart, que é o tipo de falha que ninguém percebe.
+_retention_applied: set[str] = set()
+_retention_lock = threading.Lock()
+RETENTION_RULE_ID = "pdf-extractor-retencao"
+
+
+def _ensure_retention(client, bucket: str) -> None:
+    """Garante a regra de expiração no bucket. Nunca derruba o upload.
+
+    Quem apaga é o Minio, não este serviço — a regra é declarativa e vale para
+    o bucket inteiro, incluindo o que já estava lá."""
+    if MINIO_RETENTION_DAYS <= 0:
+        return
+    with _retention_lock:
+        if bucket in _retention_applied:
+            return
+    try:
+        from minio.lifecycleconfig import LifecycleConfig, Rule, Expiration
+        from minio.commonconfig import ENABLED, Filter
+
+        existente = None
+        try:
+            existente = client.get_bucket_lifecycle(bucket)
+        except Exception:
+            existente = None  # bucket sem lifecycle ainda
+
+        ja_correta = False
+        if existente is not None:
+            for r in getattr(existente, "rules", []) or []:
+                exp = getattr(r, "expiration", None)
+                if (getattr(r, "rule_id", None) == RETENTION_RULE_ID
+                        and exp is not None
+                        and getattr(exp, "days", None) == MINIO_RETENTION_DAYS):
+                    ja_correta = True
+                    break
+
+        if not ja_correta:
+            client.set_bucket_lifecycle(bucket, LifecycleConfig([
+                Rule(
+                    ENABLED,
+                    rule_id=RETENTION_RULE_ID,
+                    rule_filter=Filter(prefix=""),
+                    expiration=Expiration(days=MINIO_RETENTION_DAYS),
+                ),
+            ]))
+            logger.info(
+                f"Retenção aplicada em '{bucket}': objetos expiram em "
+                f"{MINIO_RETENTION_DAYS} dias"
+            )
+        with _retention_lock:
+            _retention_applied.add(bucket)
+    except Exception:
+        # Não marca como aplicada: tenta de novo na próxima request, em vez de
+        # deixar o bucket acumulando sem ninguém saber.
+        logger.exception(
+            f"Falha ao aplicar retenção em '{bucket}' — o bucket pode estar "
+            f"acumulando sem prazo"
+        )
+
+
 def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> tuple[str | None, str | None]:
     """Salva PDF no Minio. Devolve (caminho, erro) — nunca engole a falha.
 
@@ -1020,6 +1089,8 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> tupl
                 # e ambas tentaram criar. Perder essa corrida não é erro.
                 if e.code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
                     raise
+
+        _ensure_retention(client, bucket)
 
         client.put_object(
             bucket,

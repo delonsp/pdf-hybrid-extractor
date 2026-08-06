@@ -78,7 +78,13 @@ Vision model: `gemini-2.5-flash` (set at `VISION_MODEL`). When changing models, 
 
 DOCX path (Flask route only, not `process_pdf`): `_detect_type()` peeks magic bytes (`%PDF` vs `PK\x03\x04`); DOCX bytes go straight to `extract_text_docx` (mammoth). Caller can override with `type: "pdf"|"docx"` in the body.
 
-Optional: original PDF persisted to Minio at `<bucket>/<telefone>/<timestamp>.pdf` when `save_to_minio=True`. DOCX uploads to Minio not yet implemented.
+Optional: original PDF persisted to Minio at `<bucket>/<prefix>/<timestamp>_<uuid>.pdf` when `save_to_minio=True`, **after** the PDF has been validated (it used to be stored first, so a corrupt file left junk in the bucket). It is still kept if extraction fails later — that is when having the original matters most. DOCX uploads to Minio not yet implemented.
+
+**Retention: 60 days.** The bucket is a working area for interpretation, **not an exam repository** — that is a deliberate decision, not a default. `MINIO_RETENTION_DAYS` (60) is applied as an S3 lifecycle rule on the bucket, once per process; Minio does the deleting. A failure to apply it does not break the upload, but it is *not* cached as done either — otherwise retention would silently vanish until the next restart. Set to `0` to disable (unbounded growth). **The rule covers the whole bucket, including objects already there** — changing the value re-writes the rule, and lowering it deletes everything past the new cutoff on the next sweep, irreversibly.
+
+Object key prefix: `MINIO_KEY_MODE` is `telefone` (current, default) or `pseudonimo` (HMAC-SHA256 of the phone with `MINIO_KEY_SALT`, first 32 hex chars — stable, so grouping per patient still works, but not reversible). The salt is mandatory in that mode: the phone-number space is small enough to brute-force a plain hash. **Default stays on `telefone` because switching changes the bucket layout and breaks prefix lookups on objects already written** — that is a migration decision. While it stays, the phone is exposed in bucket listings, metrics and the returned `minio_path`.
+
+`minio_stored` / `minio_error` report whether persistence actually happened. It used to fail silently: an upload error returned `success: true` with `minio_path: null`, so a caller that asked for persistence had no way to know it did not happen. Extraction results are not discarded when storage fails.
 
 ### Key constants (top of file)
 
