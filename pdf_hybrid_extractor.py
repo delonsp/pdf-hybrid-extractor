@@ -91,6 +91,13 @@ REQUEST_DEADLINE = int(os.getenv("REQUEST_DEADLINE", "110"))
 # dobra o custo da página exatamente quando o tempo está mais apertado; se não
 # cabe outra chamada, é melhor devolver a página como falha e preservar as outras.
 FALLBACK_MIN_BUDGET = int(os.getenv("FALLBACK_MIN_BUDGET", "25"))
+# Não começar página nova se restar menos que isto. DESLIGADO por padrão (0), e
+# de propósito: a latência medida tem cauda pesada (p50 4,5s, p99 85s, máx 95s),
+# e apertar isso transformaria em parcial documentos que hoje COMPLETAM — logo os
+# mais lentos, que tendem a ser os mais densos. Trocar completude de laudo por
+# disponibilidade de thread é o trade errado por default. Existe como alavanca
+# caso a exaustão de threads apareça de verdade; o certo mesmo é fila assíncrona.
+VISION_START_MIN_BUDGET = int(os.getenv("VISION_START_MIN_BUDGET", "0"))
 # Admission control: menor que o nº de threads do gunicorn de propósito, pra
 # sempre sobrar thread para o /health e para devolver 503 rápido. Enfileirar não
 # ajuda — a espera sai do mesmo orçamento de 120s do chamador.
@@ -579,7 +586,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                 # que só começariam depois do prazo desistem aqui, de graça.
                 if is_cancelled is not None and is_cancelled():
                     return pn, None, "cancelled"
-                if _remaining(deadline) <= 0:
+                if _remaining(deadline) <= max(VISION_START_MIN_BUDGET, 0):
                     return pn, None, "deadline"
                 try:
                     with doc_lock:

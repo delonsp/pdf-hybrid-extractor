@@ -223,6 +223,53 @@ no pico: **conferir o RPM da conta antes**, senão troca-se timeout por 429 em m
 
 ---
 
+### 4.4c · Calibração com distribuição real (06/08/2026) — ⚠ corrige a tabela acima
+
+Um dia inteiro de dados, `n = 38`. **93% dos documentos com mime detectado são PDF** (38 de 41;
+o único que ficou local foi um xlsx). Ou seja: **o extrator é o caminho principal, não um
+caminho secundário** — o que eleva a consequência de tudo neste PRD.
+
+| p50 | p90 | p99 | máximo |
+|---|---|---|---|
+| **4,5s** | 32,9s | 85,4s | **95,4s** |
+
+Acima de 60s: 3 · acima de 90s: 1 · acima de 110s: **nenhum**
+
+⚠ **A tabela de vazão do §4.4b estava errada.** Ela usou média de 18-30s, tirada de uma amostra
+de 1-2 medições, e chegou a 8-13 PDFs/min. A **mediana real é 4,5s**:
+
+| | Estimado antes | Real |
+|---|---|---|
+| Vazão, 4 threads | 8-13/min | **~53/min** |
+| Vazão, 3 slots de admissão | — | **~40/min** |
+| Rajada de 59/min | não absorve | quase absorve |
+
+**A conclusão inverte: o gargalo não é vazão, é a cauda.** Um PDF de 95,4s segura uma thread
+pelo tempo de **21 PDFs medianos**. Com 3 slots, bastam 3 documentos da cauda simultâneos para
+tudo o mais tomar 503 por ~85s.
+
+**Consequência de desenho: subir `VISION_PARALLEL` rende pouco.** O problema não é falta de
+paralelismo, é o item lento ocupando slot. Isso é uma boa notícia dupla — dispensa o risco de
+429 em massa que o próprio B3d levantou, e mantém `VISION_PARALLEL=3`.
+
+**Decisão consciente: NÃO apertar o deadline.** A tentação seria cortar em ~70s para liberar
+thread mais cedo. **Recusado.** Hoje um documento de 95,4s *completa*; um corte em 70s o
+transformaria em parcial. Isso troca completude de laudo clínico por disponibilidade de thread —
+e justamente nos documentos mais lentos, que tendem a ser os mais densos, os que mais importam.
+O prazo de 110s fica, e a cauda continua cabendo nele.
+
+Existe o knob `VISION_START_MIN_BUDGET` (default `0` = desligado): não começa página nova se
+restar menos que X segundos de orçamento. Para quando/se a exaustão de threads acontecer de
+verdade. **A solução certa para a cauda é fila assíncrona** (§3, fora de escopo), não truncar
+documento clínico.
+
+**O prazo está bem calibrado, mas apertado:** o máximo observado usou 87% do orçamento. Com
+amostra maior, algum vai estourar — então o que importa é o parcial ser **preservado e visível**,
+não o prazo ser generoso. Confirmado em campo: a detecção de parcial já pegou um laudo
+incompleto que antes teria sido gravado como completo.
+
+---
+
 ### 4.5 · P1-6 — O prompt pede interpretação clínica
 
 `VISION_PROMPT` (`:92`) termina com: *"Se for uma imagem de exame (ultrassom, raio-x, etc),

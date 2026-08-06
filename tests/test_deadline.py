@@ -95,6 +95,28 @@ class TestDeadlineInProcessPdf:
         assert result["complete"] is True
 
 
+class TestStartMinBudget:
+    """Alavanca desligada por padrão: apertar transformaria em parcial documento
+    que hoje completa — e logo o mais lento, que tende a ser o mais denso."""
+
+    def test_disabled_by_default(self):
+        assert pdfx.VISION_START_MIN_BUDGET == 0
+
+    def test_page_still_starts_with_small_budget_when_disabled(self, make_pdf, mocker, fake_gemini_client):
+        pdf = make_pdf([{"text": "X", "image_rect": (50, 100, 550, 700)}])
+        _patch_gemini(mocker, fake_gemini_client, {PRIMARY: "extraído"})
+        result = pdfx.process_pdf(pdf, deadline=time.monotonic() + 3)
+        assert result["pages_with_vision"] == 1
+
+    def test_page_skipped_when_knob_is_on(self, make_pdf, mocker, fake_gemini_client, monkeypatch):
+        monkeypatch.setattr(pdfx, "VISION_START_MIN_BUDGET", 30)
+        pdf = make_pdf([{"text": "X", "image_rect": (50, 100, 550, 700)}])
+        fake = _patch_gemini(mocker, fake_gemini_client, {PRIMARY: "não deveria rodar"})
+        result = pdfx.process_pdf(pdf, deadline=time.monotonic() + 10)
+        assert fake.calls == []
+        assert result["pages_deadline_skipped"] == [1]
+
+
 class TestCallerGaveUp:
     """O webhook desiste em 120s; seguir trabalhando é desperdício garantido."""
 
