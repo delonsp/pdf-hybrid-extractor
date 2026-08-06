@@ -133,6 +133,10 @@ Response: `{success, complete, type, total_pages, pages_with_vision, pages_hybri
 
 **`complete` is the key the caller must check.** It is `false` whenever anything was dropped — page cap, deadline, caller disconnect, per-page failure, or text truncation. `success: true` only means the request itself did not error; it never meant the extraction was whole. Persisting a record without checking `complete` is how an incomplete clinical document gets stored with nobody noticing.
 
+**`text` is transcription only; `image_analysis` is the model's reading.** The Vision prompt has two sections split by `===ANALISE_DA_IMAGEM===`. Everything before it is a literal transcription of the document — nothing the model inferred belongs there. Everything after lands in `image_analysis` (keyed by page number as a string), which **may contain diagnostic hypotheses**: that is intended, by the physician's decision, as long as the prompt keeps them non-conclusive and leaves differentials open. What is not allowed is the two being indistinguishable, which is what the old prompt produced by concatenating them under one marker.
+
+If the model omits the marker, the page number goes into `analysis_unseparated` and the whole output stays in `text`. That page's text may therefore contain model inference — the flag exists because pretending the split worked is worse than admitting it did not. `VISION_ANALYZE_IMAGES=false` disables the analysis section entirely.
+
 `pages_deadline_skipped` / `deadline_exceeded` are kept separate from `failed_pages` on purpose: running out of budget is not a Vision failure, and conflating them makes diagnosis harder. `caller_gone: true` means the caller disconnected and extraction stopped early.
 
 `503` + `Retry-After` means the server was at capacity — retry with backoff, the request was not processed. `pages_hybrid` is a subset of `pages_with_vision` — pages where text + Vision were combined (medical-report case). `failed_pages` lists page numbers where Vision errored or returned empty (those pages still appear in `text` with native fallback when available).

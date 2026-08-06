@@ -47,7 +47,7 @@ class TestProcessPdf:
         assert result["pages_hybrid"] == 1
         assert "Cabeçalho do laudo" in result["text"]
         assert "image: ultrasound shows X" in result["text"]
-        assert "texto + Vision AI" in result["text"]
+        assert "texto + transcrição da imagem" in result["text"]
 
     def test_cap_skips_excess(self, make_pdf, mocker, monkeypatch, fake_gemini_client):
         monkeypatch.setattr(pdfx, "MAX_VISION_PAGES", 2)

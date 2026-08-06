@@ -370,7 +370,7 @@ allowlist) e A8 (config de infra).
 - [ ] B3d. Conferir o **RPM da conta Gemini** antes de subir `VISION_PARALLEL` (5 paralelas × 4 threads = 20 chamadas simultâneas no pico)
 - [x] B4. Resposta parcial explícita: `complete: false` / `truncated: true` + `WARNING` no log; nunca `success: true` mudo
 - [x] B5. `MAX_VISION_PAGES`, `VISION_PARALLEL`, `GEMINI_TIMEOUT`, `MIN_TEXT_THRESHOLD` por env
-- [ ] B6. `VISION_PROMPT` de **transcrição literal**; descrição visual, se mantida, em campo separado e rotulado
+- [x] B6. `VISION_PROMPT` de **transcrição literal**; análise da imagem em campo separado (`image_analysis`). ⚠ **Correção de rumo:** a versão inicial proibia diagnóstico e desligava a descrição por padrão — os dois errados. O defeito nunca foi a análise existir, foi ela sair **misturada** com a transcrição; separada, o defeito já está corrigido, e desligá-la só apagaria informação da página que é só foto de exame. Por decisão do Dr. Alain (06/08), **hipótese diagnóstica é permitida** no campo de análise, desde que não feche diagnóstico e mantenha os diferenciais em aberto. A transcrição segue literal — é a cópia fiel do documento
 - [ ] B7. Ler `finish_reason` / `prompt_feedback` / `model_version` e distinguir safety de `MAX_TOKENS` e de vazio
 - [ ] B8. **Medir num DUTCH real de 16 páginas**: as páginas de gráfico são classificadas `native` ou `vision`? Só então decidir entre subir o cap e tratar conteúdo vetorial
 - [ ] B9. Minio: validar antes de gravar; falha vira erro explícito; chave **pseudonimizada** (sem telefone); resolver a corrida do bucket

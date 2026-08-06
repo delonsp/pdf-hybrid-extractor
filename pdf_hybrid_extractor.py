@@ -156,16 +156,75 @@ ALLOWED_DOWNLOAD_TYPES = {
     "application/msword",
     "application/zip",  # alguns servers servem .docx assim
 }
-VISION_PROMPT = """Analise esta imagem de um documento médico/exame e extraia TODAS as informações textuais visíveis.
-Inclua:
-- Dados do paciente (nome, idade, data)
-- Nome do exame
-- Resultados e valores
-- Valores de referência
-- Conclusões e observações
-- Assinaturas e datas
+# Análise de imagem de exame: LIGADA por padrão. O defeito antigo não era ela
+# existir — era sair misturada com a transcrição, sem nada dizendo qual é qual.
+# Separada e rotulada, preserva informação que a transcrição literal perderia
+# (uma página que é só foto de ultrassom transcreve quase nada).
+VISION_ANALYZE_IMAGES = os.getenv("VISION_ANALYZE_IMAGES", "true").lower() == "true"
+VISION_ANALYSIS_MARKER = "===ANALISE_DA_IMAGEM==="
 
-Formate de forma clara e organizada. Se for uma imagem de exame (ultrassom, raio-x, etc), descreva o que é visível."""
+# Duas seções com finalidades diferentes, e a fronteira entre elas é o ponto todo:
+#   TRANSCRIÇÃO = cópia fiel do que o documento diz. Nada entra aqui que não esteja
+#   escrito — não por segurança, mas por fidelidade: é o registro do documento.
+#   ANÁLISE = leitura do modelo sobre a imagem. Pode levantar hipótese diagnóstica,
+#   desde que como hipótese; o que não pode é FECHAR diagnóstico.
+# Antes as duas saíam concatenadas sob o mesmo marcador, direto pro prontuário,
+# sem nada distinguindo o que foi lido do que foi inferido.
+VISION_PROMPT_TRANSCRICAO = """Transcreva LITERALMENTE todo o texto visível nesta imagem de documento médico.
+
+Regras obrigatórias:
+- Transcreva apenas o que está ESCRITO. Não interprete, não resuma, não complete.
+- Não acrescente nesta seção nenhuma leitura sua: ela é a cópia fiel do documento.
+- Preserve os valores EXATAMENTE como aparecem: números, unidades, separadores decimais e valores de referência.
+- Preserve a estrutura: cabeçalhos, tabelas linha a linha, rodapés, assinaturas e datas.
+- Trecho ilegível, cortado ou borrado: escreva [ilegível] no lugar. NUNCA adivinhe valor, unidade, data ou nome.
+- Se houver imagem de exame (ultrassom, raio-x, tomografia), escreva apenas [imagem de exame] na posição onde ela aparece.
+
+Se não houver nenhum texto legível, responda exatamente: [sem texto legível]"""
+
+VISION_PROMPT_ANALISE = f"""
+
+Depois da transcrição, acrescente SEMPRE uma seção iniciada por esta linha exata:
+{VISION_ANALYSIS_MARKER}
+
+Se não houver imagem de exame nesta página, escreva nela apenas: sem imagem de exame
+
+Essa seção é análise sua, não transcrição. Havendo imagem, organize em duas partes:
+- "Visível:" o que aparece objetivamente na imagem (tipo de exame, região, estruturas, marcações, medidas legíveis).
+- "Hipóteses:" possibilidades diagnósticas que os achados sugerem.
+
+Nas hipóteses: levante possibilidades, mas NÃO feche diagnóstico. Use formulação não
+conclusiva ("achados podem ser compatíveis com...", "considerar..."), mantenha os
+diferenciais em aberto e não afirme certeza. Se os achados não permitirem hipótese
+com segurança, escreva "Hipóteses: não é possível levantar com segurança"."""
+
+
+def _build_vision_prompt() -> str:
+    """Monta o prompt na hora da chamada — permite trocar por env sem redeploy."""
+    if VISION_ANALYZE_IMAGES:
+        return VISION_PROMPT_TRANSCRICAO + VISION_PROMPT_ANALISE
+    return VISION_PROMPT_TRANSCRICAO
+
+
+def _split_vision_output(raw: str) -> tuple[str, str | None, bool]:
+    """Separa transcrição de análise da imagem.
+
+    Devolve (transcrição, análise|None, separação_falhou). Se a análise está
+    ligada mas o modelo não emitiu o marcador, NÃO dá pra saber onde uma termina
+    e a outra começa. Nesse caso o texto vai inteiro como transcrição e a página
+    é SINALIZADA — fingir que a separação aconteceu seria pior que admitir que
+    não aconteceu, porque é exatamente aí que hipótese entraria no prontuário
+    passando por transcrição."""
+    if VISION_ANALYSIS_MARKER in raw:
+        transcricao, _, analise = raw.partition(VISION_ANALYSIS_MARKER)
+        analise = analise.strip()
+        # A seção é sempre pedida; "sem imagem de exame" é a resposta esperada
+        # em página de texto puro e não vira campo de análise.
+        if analise.lower().startswith("sem imagem de exame"):
+            analise = ""
+        return transcricao.strip(), analise or None, False
+    # Sem marcador: só é problema quando a análise foi pedida.
+    return raw.strip(), None, VISION_ANALYZE_IMAGES
 
 
 def setup_gemini():
@@ -379,7 +438,7 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
             call_timeout = int(min(GEMINI_TIMEOUT, left) * 1000)  # ms
             response = client.models.generate_content(
                 model=model_name,
-                contents=[VISION_PROMPT, image_part],
+                contents=[_build_vision_prompt(), image_part],
                 config=types.GenerateContentConfig(
                     http_options=types.HttpOptions(timeout=call_timeout)
                 ),
@@ -685,6 +744,12 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         pages_skipped_vision = 0
         failed_pages = []
 
+        # Análise da imagem vai em campo PRÓPRIO, nunca concatenada no texto: é
+        # leitura do modelo (inclusive hipótese diagnóstica), não transcrição, e
+        # no prontuário as duas coisas não podem ficar indistinguíveis.
+        image_analysis: dict[int, str] = {}
+        analysis_unseparated: list[int] = []
+
         for meta in page_metas:
             pn = meta["page_num"]
             native = meta["text"]
@@ -709,14 +774,28 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                         )
                 else:
                     pages_with_vision += 1
+                    transcricao, analise, nao_separou = _split_vision_output(vtext)
+                    if analise:
+                        image_analysis[pn] = analise
+                    if nao_separou:
+                        # O modelo não emitiu o marcador: não dá pra garantir que
+                        # o texto abaixo é só transcrição. Fica sinalizado em vez
+                        # de passar por transcrição sem ser.
+                        analysis_unseparated.append(pn)
+                        logger.warning(
+                            f"Página {pn}: análise da imagem não veio separada — "
+                            f"o texto pode conter leitura do modelo"
+                        )
                     if mode == "hybrid":
                         pages_hybrid += 1
                         results.append(
-                            f"--- Página {pn} (texto + Vision AI) ---\n{native}\n\n"
-                            f"[Vision AI - conteúdo de imagem]:\n{vtext}"
+                            f"--- Página {pn} (texto + transcrição da imagem) ---\n{native}\n\n"
+                            f"[Transcrição da imagem]:\n{transcricao}"
                         )
                     else:
-                        results.append(f"--- Página {pn} (Vision AI) ---\n{vtext}")
+                        results.append(
+                            f"--- Página {pn} (transcrição via Vision AI) ---\n{transcricao}"
+                        )
             elif pn in skipped_set:
                 pages_skipped_vision += 1
                 if mode == "hybrid":
@@ -770,6 +849,10 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             "failed_pages": failed_pages,
             "text_truncated": text_truncated,
             "text": combined_text,
+            # Geração do modelo, separada da transcrição de propósito. Quem
+            # persistir isso no prontuário tem que manter a distinção.
+            "image_analysis": {str(k): v for k, v in sorted(image_analysis.items())},
+            "analysis_unseparated": sorted(analysis_unseparated),
             "minio_path": minio_path,
         }
     finally:
@@ -990,6 +1073,8 @@ def create_app():
                     "failed_pages": [],
                     "text_truncated": False,
                     "text": extract_text_docx(pdf_source),
+                    "image_analysis": {},
+                    "analysis_unseparated": [],
                     "minio_path": None,
                 })
 
