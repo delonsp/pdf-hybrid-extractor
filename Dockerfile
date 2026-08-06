@@ -1,10 +1,17 @@
-FROM python:3.12-slim
+# Imagem pinada por DIGEST, não só por tag: "3.12-slim" é tag móvel e muda de
+# conteúdo sem aviso, então dois builds do mesmo commit podiam instalar coisas
+# diferentes. Resolvido em 06/08/2026; para atualizar, buscar o digest novo.
+FROM python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
 
 WORKDIR /app
 
-# Copia requirements primeiro (cache de layers)
+# requirements.txt é LOCK gerado por pip-compile (versões exatas + hashes,
+# incluindo transitivas). Editar requirements.in e regerar:
+#   pip-compile --generate-hashes --strip-extras -o requirements.txt requirements.in
+# --require-hashes recusa qualquer pacote fora do lock: build reprodutível de
+# verdade, e um pacote adulterado no espelho não passa despercebido.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # Copia o código
 COPY pdf_hybrid_extractor.py .

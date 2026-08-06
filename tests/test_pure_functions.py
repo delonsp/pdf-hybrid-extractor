@@ -67,8 +67,11 @@ class TestAssertSafeUrl:
         with pytest.raises(ValueError, match="missing host"):
             pdfx._assert_safe_url("http:///path-only")
 
-    def test_allows_public_dns(self):
-        # example.com resolve pra IP público — não deve levantar
+    def test_allows_public_dns(self, mocker):
+        # getaddrinfo mockado: resolver de verdade fazia a suíte depender de
+        # rede e quebrar offline / em CI sem DNS
+        mocker.patch("pdf_hybrid_extractor.socket.getaddrinfo",
+                     return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
         pdfx._assert_safe_url("http://example.com/x")
         pdfx._assert_safe_url("https://example.com/x")
 

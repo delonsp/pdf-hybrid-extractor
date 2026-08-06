@@ -383,18 +383,18 @@ allowlist) e A8 (config de infra).
 
 - [~] C1. Pinar `VISION_MODEL` em ID explícito (fim do alias). **Ferramenta pronta, valor pendente:** o catálogo de modelos depende do projeto/billing, então o ID certo não dá pra escolher de fora. `--check-models` lista os modelos do projeto e resolve o alias em um comando. Enquanto não for pinado, todo call loga qual modelo atendeu de fato, e uma troca de alias vira WARNING — o evento fica visível em vez de silencioso
 - [~] C2. Medir thinking numa amostra anonimizada e **só então** fixar o nível. **Harness pronto:** `--benchmark <pdf>` roda modelos × níveis numa página real, reporta tokens de raciocínio, tempo e tamanho, e grava cada transcrição em `benchmark-vision/` para comparação. `VISION_THINKING_LEVEL` segue **não setado** de propósito — a medição é que decide. Falta rodar com um laudo anonimizado
-- [ ] C3. Retry **depois** do deadline existir (B3): respeitar `Retry-After`, orçamento total de tentativas somando primário + fallback. *(Nota: verifiquei em `_api_client.py:531` que `retry_args(None)` devolve `stop_after_attempt(1)` — a SDK **não** repete sozinha. `MAX_RETRY_COUNT=3` só vale para upload de arquivo.)*
-- [ ] C4. Lock completo: versões exatas **com transitivas e hashes**, e imagem Docker pinada por **digest** — ⚠ pinar só os diretos não torna o build reprodutível
-- [ ] C5. Congelar o conjunto atual primeiro; upgrades (PyMuPDF 1.28, google-genai 2.16, flask 3.1.3, flask-limiter 4.x, gunicorn 26.x) em **PR separado**, um por vez
-- [ ] C6. Handlers de erro **JSON** para 400/404/405/413/415/429 — hoje só o 500 e o 400 do `ValueError` são JSON
-- [ ] C7. Validar o corpo: rejeitar JSON escalar/lista (hoje `.get()` num `list` → 500) e `type` não-string (`type: 123` → `.lower()` → 500); `type` restrito a `{pdf, docx}`
-- [ ] C8. `_detect_type`: confirmar estrutura DOCX (junto com A5, que é o que de fato protege)
-- [ ] C9. Resposta DOCX coerente: sem `total_pages: 1` falso; sinalizar DOCX com imagem/scan que não passou pelo Vision em vez de devolver texto vazio como sucesso
-- [ ] C10. Símbolos clínicos: ⚠ **NFC não unifica `µ` (U+00B5) e `μ` (U+03BC)** — confirmei empiricamente; NFKC unifica mas destrói `m² → m2`. Usar mapeamento dirigido, não normalização cega
-- [ ] C11. Conferir a cadeia de proxies do Dokploy e restringir a porta 5050 ao Traefik (`ProxyFix(x_for=1)`)
-- [ ] C12. Resolver a situação de licença do PyMuPDF (AGPL vs comercial Artifex) e documentar
-- [ ] C13. `tests/test_pure_functions.py:70` resolve `example.com` de verdade — mockar `socket.getaddrinfo`
-- [ ] C14. Atualizar `CLAUDE.md` e `README.md` — ⚠ **a conta de pior caso do timeout está errada lá** (§4.2), e a premissa de thread-safety do lock também (§4.3)
+- [x] C3. Retry **depois** do deadline existir (B3): respeitar `Retry-After`, orçamento total de tentativas somando primário + fallback. *(Nota: verifiquei em `_api_client.py:531` que `retry_args(None)` devolve `stop_after_attempt(1)` — a SDK **não** repete sozinha. `MAX_RETRY_COUNT=3` só vale para upload de arquivo.)*
+- [x] C4. Lock completo: versões exatas **com transitivas e hashes**, e imagem Docker pinada por **digest** — ⚠ pinar só os diretos não torna o build reprodutível
+- [x] C5. Congelar o conjunto atual primeiro; upgrades (PyMuPDF 1.28, google-genai 2.16, flask 3.1.3, flask-limiter 4.x, gunicorn 26.x) em **PR separado**, um por vez
+- [x] C6. Handlers de erro **JSON** para 400/404/405/413/415/429 — hoje só o 500 e o 400 do `ValueError` são JSON
+- [x] C7. Validar o corpo: rejeitar JSON escalar/lista (hoje `.get()` num `list` → 500) e `type` não-string (`type: 123` → `.lower()` → 500); `type` restrito a `{pdf, docx}`
+- [x] C8. `_detect_type`: confirmar estrutura DOCX (junto com A5, que é o que de fato protege)
+- [x] C9. Resposta DOCX coerente: sem `total_pages: 1` falso; sinalizar DOCX com imagem/scan que não passou pelo Vision em vez de devolver texto vazio como sucesso
+- [x] C10. Símbolos clínicos: ⚠ **NFC não unifica `µ` (U+00B5) e `μ` (U+03BC)** — confirmei empiricamente; NFKC unifica mas destrói `m² → m2`. Usar mapeamento dirigido, não normalização cega
+- [~] C11. `PROXY_FIX_HOPS` agora é env (era fixo em 1). **Falta a parte de infra:** conferir a cadeia real de proxies do Dokploy e restringir a porta 5050 ao Traefik. Confiar em mais hops do que existem deixa o cliente forjar o IP que o rate limit enxerga; confiar em menos faz o limite valer pro IP do proxy — um balde só pra todo mundo
+- [ ] C12. **Licença do PyMuPDF — decisão que não é técnica.** PyMuPDF é distribuído sob AGPL-3.0 **ou** licença comercial da Artifex. O ponto sensível da AGPL é a cláusula de rede (seção 13): quem *interage com o software pela rede* pode ter direito ao código-fonte. Aqui o serviço não é distribuído nem oferecido a terceiros — roda numa clínica, chamado pelo n8n da própria clínica — o que provavelmente afasta o gatilho, mas "provavelmente" não é resposta para licença. Fatos para levar a quem decide: (a) o serviço é interno e não há oferta a terceiros; (b) pacientes interagem via WhatsApp, não com o serviço diretamente; (c) o código não é distribuído. **Não sou a fonte certa para isso** — vale confirmar com quem cuida do jurídico, ou comprar a licença comercial e encerrar a dúvida
+- [x] C13. `tests/test_pure_functions.py:70` resolve `example.com` de verdade — mockar `socket.getaddrinfo`
+- [x] C14. Atualizar `CLAUDE.md` e `README.md` — ⚠ **a conta de pior caso do timeout está errada lá** (§4.2), e a premissa de thread-safety do lock também (§4.3)
 
 ### Lote D — Spikes medidos (nenhum entra no mesmo release dos Lotes A/B)
 

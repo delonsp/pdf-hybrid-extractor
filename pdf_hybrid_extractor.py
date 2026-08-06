@@ -108,6 +108,11 @@ VISION_START_MIN_BUDGET = int(os.getenv("VISION_START_MIN_BUDGET", "0"))
 # ajuda — a espera sai do mesmo orçamento de 120s do chamador.
 MAX_CONCURRENT_EXTRACTIONS = int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "3"))
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "30"))
+# Quantos proxies confiar no X-Forwarded-For. Tem que bater com a cadeia REAL do
+# Dokploy: confiar em mais hops do que existem deixa o cliente forjar o IP que o
+# rate limit enxerga; confiar em menos faz o limite valer pro IP do proxy, ou
+# seja, um balde só para todo mundo.
+PROXY_FIX_HOPS = int(os.getenv("PROXY_FIX_HOPS", "1"))
 ABORT_ON_CLIENT_DISCONNECT = os.getenv("ABORT_ON_CLIENT_DISCONNECT", "true").lower() == "true"
 # Primário: alias dinâmico (hoje aponta pro flash mais novo, podendo ser preview/3.x).
 # Fallback: pinned em 2.5-flash (estável). Cascata é per-page — falha pontual no
@@ -118,6 +123,11 @@ VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
 # escuro pode piorar o OCR, que é justamente o que não se quer perder. Medir com
 # `--benchmark` antes de fixar. Valores: minimal | low | medium | high.
 VISION_THINKING_LEVEL = os.getenv("VISION_THINKING_LEVEL", "").strip().lower()
+# Retry em erro transitório (429/5xx). Orçamento TOTAL de tentativas, somando
+# primário e fallback — sem isso, 3 tentativas × 2 modelos = 6 chamadas dentro
+# de um prazo que já é apertado. Retry só acontece se couber no que resta.
+VISION_MAX_ATTEMPTS = int(os.getenv("VISION_MAX_ATTEMPTS", "3"))
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 # Redirects: seguidos manualmente pra revalidar CADA hop contra o guard anti-SSRF.
 # requests seguiria sozinho e o guard só teria visto a URL inicial — um 302 para
@@ -366,6 +376,40 @@ def download_file(url: str) -> bytes:
     raise ValueError(f"too many redirects (max {MAX_REDIRECTS})")
 
 
+# Símbolos que quebram comparação a jusante. NFC sozinho NÃO resolve: ele compõe
+# acentos mas preserva µ (U+00B5, "micro") e μ (U+03BC, "mu grego") como
+# caracteres distintos — verificado. E NFKC resolveria esse par, mas converte
+# m² em m2, destruindo unidade de superfície corporal. Daí o mapa dirigido.
+SUBSTITUICOES_CLINICAS = {
+    "µ": "μ",  # micro → mu grego (o que o NFKC faria, sem o resto)
+    " ": " ",       # espaço inseparável → espaço
+    "−": "-",       # sinal de menos Unicode → hífen (ex: "-2,5 DP")
+    "–": "-",       # en dash → hífen (faixas de referência)
+    "—": "-",       # em dash → hífen
+}
+
+
+def normalizar_texto_clinico(texto: str) -> str:
+    """NFC + substituições dirigidas de símbolo clínico.
+
+    Sem isso, "µg/dL" e "μg/dL" são strings diferentes e a busca do n8n acha uma
+    e perde a outra — sem erro nenhum, só resultado faltando."""
+    import unicodedata
+    texto = unicodedata.normalize("NFC", texto)
+    for de, para in SUBSTITUICOES_CLINICAS.items():
+        texto = texto.replace(de, para)
+    return texto
+
+
+def _docx_tem_imagem(docx_bytes: bytes) -> bool:
+    """DOCX com imagem embutida (scan colado no Word) não passa pelo Vision."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            return any(n.startswith("word/media/") for n in zf.namelist())
+    except Exception:
+        return False
+
+
 def _detect_type(data: bytes) -> str:
     """Detecta tipo de documento via magic bytes."""
     if data.startswith(b"%PDF"):
@@ -518,6 +562,26 @@ def _thinking_config(types):
     return types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL.upper())
 
 
+def _retry_delay(exc, tentativa: int) -> float | None:
+    """Espera antes de repetir, ou None se o erro não é para repetir.
+
+    Respeita `Retry-After` quando o servidor manda: em 429 ele diz quando a cota
+    volta, e ignorar isso é repetir cedo demais e tomar 429 de novo — gastando
+    o orçamento e ainda piorando a fila do lado deles."""
+    status = getattr(exc, "code", None)
+    if status not in RETRYABLE_STATUS:
+        return None
+    try:
+        resposta = getattr(exc, "response", None)
+        cabecalhos = getattr(resposta, "headers", None) or {}
+        bruto = cabecalhos.get("Retry-After") or cabecalhos.get("retry-after")
+        if bruto and str(bruto).strip().isdigit():
+            return float(str(bruto).strip())
+    except Exception:
+        pass
+    return min(2.0 ** (tentativa - 1), 8.0)  # 1s, 2s, 4s, teto de 8s
+
+
 def _remaining(deadline: float | None) -> float:
     """Segundos restantes do orçamento da requisição (infinito se não há prazo)."""
     if deadline is None:
@@ -528,16 +592,18 @@ def _remaining(deadline: float | None) -> float:
 def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
                               deadline: float | None = None,
                               diagnostics: dict | None = None) -> str | None:
-    """Envia imagem para Gemini Vision com cascata primário→fallback CONDICIONAL
-    ao orçamento restante.
+    """Envia imagem para Gemini Vision com retry e cascata primário→fallback,
+    ambos CONDICIONAIS ao orçamento restante.
 
-    Tenta VISION_MODEL primeiro; em falha (exceção, vazio ou safety filter),
-    tenta VISION_MODEL_FALLBACK **apenas se ainda sobrar FALLBACK_MIN_BUDGET**.
-    Incondicional, a cascata dobrava o custo da página justamente quando o tempo
-    estava mais apertado, roubando o prazo das páginas seguintes.
+    Ordem: tenta o modelo primário; em erro transitório (429/5xx) repete o MESMO
+    modelo com backoff, porque trocar de modelo não resolve cota estourada — o
+    fallback tomaria o mesmo 429. Em erro definitivo ou resposta vazia, cai pro
+    fallback, mas só se ainda sobrar FALLBACK_MIN_BUDGET.
 
-    O timeout de cada chamada também é apertado para o que resta do orçamento —
-    nenhuma chamada individual pode sobreviver ao prazo da requisição.
+    Dois orçamentos governam tudo: o de TEMPO (deadline, derivado do timeout do
+    chamador) e o de TENTATIVAS (VISION_MAX_ATTEMPTS, somando os dois modelos —
+    sem isso, N tentativas × 2 modelos caberia numa página só). O timeout de cada
+    chamada ainda é apertado ao que resta, então nenhuma sobrevive ao prazo.
 
     `diagnostics` (dict opcional) recebe, por página, o motivo de vazio ou
     truncamento — safety, MAX_TOKENS e recitation pedem tratamentos diferentes e
@@ -548,6 +614,40 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
     models_to_try = [VISION_MODEL]
     if VISION_MODEL_FALLBACK and VISION_MODEL_FALLBACK != VISION_MODEL:
         models_to_try.append(VISION_MODEL_FALLBACK)
+
+    estado = {"tentativas": 0}
+
+    def _chamar(model_name):
+        """Uma chamada. Devolve (texto, motivo) — exceção sobe pro chamador."""
+        estado["tentativas"] += 1
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[_build_vision_prompt(), image_part],
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(
+                    timeout=int(min(GEMINI_TIMEOUT, max(_remaining(deadline), 1)) * 1000)),
+                max_output_tokens=VISION_MAX_OUTPUT_TOKENS,
+                thinking_config=_thinking_config(types),
+            ),
+        )
+        _log_model_version(model_name, response)
+        return _inspect_response(response)
+
+    def _registrar_sucesso(texto, motivo, model_name, idx):
+        if idx > 0:
+            logger.info(f"Página {page_num}: fallback {model_name} ok")
+        if motivo == "truncado_max_tokens":
+            logger.warning(
+                f"Página {page_num}: {model_name} truncou a saída em "
+                f"{VISION_MAX_OUTPUT_TOKENS} tokens — texto pode estar cortado"
+            )
+            if diagnostics is not None:
+                diagnostics[page_num] = motivo
+        elif diagnostics is not None:
+            # Tentativa anterior pode ter deixado motivo registrado; se esta deu
+            # certo, a página NÃO é problemática.
+            diagnostics.pop(page_num, None)
+        return texto
 
     for idx, model_name in enumerate(models_to_try):
         is_last = idx == len(models_to_try) - 1
@@ -561,46 +661,48 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
         if left <= 0:
             logger.warning(f"Página {page_num}: orçamento esgotado antes de chamar {model_name}")
             return None
-        try:
-            call_timeout = int(min(GEMINI_TIMEOUT, left) * 1000)  # ms
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[_build_vision_prompt(), image_part],
-                config=types.GenerateContentConfig(
-                    http_options=types.HttpOptions(timeout=call_timeout),
-                    max_output_tokens=VISION_MAX_OUTPUT_TOKENS,
-                    thinking_config=_thinking_config(types),
-                ),
-            )
-            _log_model_version(model_name, response)
-            text, motivo = _inspect_response(response)
-            if text:
-                if idx > 0:
-                    logger.info(f"Página {page_num}: fallback {model_name} ok")
-                if diagnostics is not None and motivo != "truncado_max_tokens":
-                    # A tentativa anterior pode ter deixado um motivo registrado.
-                    # Se o fallback deu certo, a página NÃO é problemática — sem
-                    # isso ela apareceria em vision_diagnostics tendo funcionado.
-                    diagnostics.pop(page_num, None)
-                if motivo == "truncado_max_tokens":
-                    # Texto cortado no meio é pior que texto ausente: volta
-                    # parecendo completo, e o corte pode ter comido um valor.
+
+        while True:
+            if estado["tentativas"] >= VISION_MAX_ATTEMPTS:
+                logger.warning(
+                    f"Página {page_num}: orçamento de {VISION_MAX_ATTEMPTS} "
+                    f"tentativas esgotado"
+                )
+                return None
+            try:
+                texto, motivo = _chamar(model_name)
+                if texto:
+                    return _registrar_sucesso(texto, motivo, model_name, idx)
+                if diagnostics is not None:
+                    diagnostics[page_num] = motivo or "vazio"
+                msg = f"Página {page_num}: {model_name} devolveu vazio ({motivo})"
+                logger.warning(msg if is_last else f"{msg}, tentando fallback")
+                break  # vazio não é transitório: vai pro próximo modelo
+            except Exception as e:
+                espera = _retry_delay(e, estado["tentativas"])
+                if espera is None:
+                    if is_last:
+                        logger.exception(
+                            f"Página {page_num}: {model_name} falhou (último modelo)")
+                    else:
+                        logger.warning(
+                            f"Página {page_num}: {model_name} falhou ({e!r}), "
+                            f"tentando fallback")
+                    break
+                restante = _remaining(deadline)
+                if restante < espera + FALLBACK_MIN_BUDGET:
                     logger.warning(
-                        f"Página {page_num}: {model_name} truncou a saída em "
-                        f"{VISION_MAX_OUTPUT_TOKENS} tokens — texto pode estar cortado"
+                        f"Página {page_num}: {model_name} deu "
+                        f"{getattr(e, 'code', '?')}, mas repetir não cabe no "
+                        f"orçamento ({restante:.0f}s restantes)"
                     )
-                    if diagnostics is not None:
-                        diagnostics[page_num] = "truncado_max_tokens"
-                return text
-            if diagnostics is not None:
-                diagnostics[page_num] = motivo or "vazio"
-            msg = f"Página {page_num}: {model_name} devolveu vazio ({motivo})"
-            logger.warning(msg if is_last else f"{msg}, tentando fallback")
-        except Exception as e:
-            if is_last:
-                logger.exception(f"Página {page_num}: {model_name} falhou (último modelo)")
-            else:
-                logger.warning(f"Página {page_num}: {model_name} falhou ({e!r}), tentando fallback")
+                    break
+                logger.warning(
+                    f"Página {page_num}: {model_name} deu {getattr(e, 'code', '?')}, "
+                    f"repetindo em {espera:.0f}s "
+                    f"(tentativa {estado['tentativas'] + 1}/{VISION_MAX_ATTEMPTS})"
+                )
+                time.sleep(espera)
     return None
 
 
@@ -964,7 +1066,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         # sumiam do relatório quando não passavam pelo Vision.
         failed_pages = sorted(set(failed_pages) | set(classify_failed))
 
-        combined_text = "\n\n".join(results)
+        combined_text = normalizar_texto_clinico("\n\n".join(results))
         text_truncated = False
         if len(combined_text) > MAX_OUTPUT_CHARS:
             combined_text = (
@@ -1218,7 +1320,8 @@ def create_app():
 
     # Atrás de proxy reverso (Traefik/Dokploy): respeita X-Forwarded-For
     # pra que get_remote_address devolva IP real do cliente, não do proxy
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=PROXY_FIX_HOPS, x_proto=1,
+                            x_host=1, x_port=1)
 
     @app.errorhandler(HTTPException)
     def _json_errors(e):
@@ -1264,6 +1367,11 @@ def create_app():
             return jsonify({"error": "Invalid token"}), 403
 
         data = request.json or {}
+        # Corpo JSON válido mas escalar/lista: `data.get` estouraria com
+        # AttributeError e viraria 500 HTML. É input ruim, logo 400.
+        if not isinstance(data, dict):
+            return jsonify({"error": "corpo deve ser um objeto JSON",
+                            "success": False}), 400
 
         # Validação de telefone (rejeita path injection no Minio)
         telefone = data.get("telefone")
@@ -1324,13 +1432,34 @@ def create_app():
                 return jsonify({"error": "Forneça 'url' ou 'base64'"}), 400
 
             # Tipo: override via body.type, senão auto-detecta por magic bytes
-            doc_type = (data.get("type") or "").lower() or _detect_type(pdf_source)
+            tipo_pedido = data.get("type")
+            if tipo_pedido is not None and not isinstance(tipo_pedido, str):
+                # `type: 123` fazia .lower() estourar e virar 500 genérico
+                raise ValueError("'type' deve ser string ('pdf' ou 'docx')")
+            tipo_pedido = (tipo_pedido or "").lower()
+            if tipo_pedido and tipo_pedido not in ("pdf", "docx"):
+                # Antes caía silenciosamente no caminho de PDF e devolvia
+                # "PDF inválido", escondendo o erro real do chamador
+                raise ValueError(f"'type' inválido: {tipo_pedido!r} (use 'pdf' ou 'docx')")
+            doc_type = tipo_pedido or _detect_type(pdf_source)
             if doc_type == "docx":
+                texto_docx = normalizar_texto_clinico(extract_text_docx(pdf_source))
+                tem_imagem = _docx_tem_imagem(pdf_source)
+                if tem_imagem:
+                    logger.warning(
+                        "DOCX com imagem embutida: o conteúdo dela NÃO passa "
+                        "pelo Vision e não está no texto"
+                    )
                 return jsonify({
                     "success": True,
-                    "complete": True,
+                    # DOCX não tem paginação confiável sem renderizar o
+                    # documento — `total_pages: 1` era informação falsa.
+                    # E imagem embutida (scan colado no Word) não é extraída:
+                    # a resposta não pode se declarar completa nesse caso.
+                    "complete": not tem_imagem,
+                    "has_unextracted_images": tem_imagem,
                     "type": "docx",
-                    "total_pages": 1,
+                    "total_pages": None,
                     "pages_with_vision": 0,
                     "pages_hybrid": 0,
                     "pages_skipped_vision": 0,
@@ -1339,7 +1468,7 @@ def create_app():
                     "caller_gone": False,
                     "failed_pages": [],
                     "text_truncated": False,
-                    "text": extract_text_docx(pdf_source),
+                    "text": texto_docx,
                     "image_analysis": {},
                     "analysis_unseparated": [],
                     "vision_diagnostics": {},

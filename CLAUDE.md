@@ -9,8 +9,14 @@ Single-file Python service (`pdf_hybrid_extractor.py`) that extracts text from P
 ## Commands
 
 ```bash
-# Install
-pip install -r requirements.txt
+# Install (requirements.txt is a pip-compile LOCK: exact versions + hashes)
+pip install --require-hashes -r requirements.txt
+
+# Change a dependency: edit requirements.in, then regenerate the lock
+pip-compile --generate-hashes --strip-extras -o requirements.txt requirements.in
+pip-compile --generate-hashes --strip-extras -o requirements-dev.txt requirements-dev.in
+# then reinstall from the lock and re-run the suite — the lock is only meaningful
+# if it is what was actually tested
 
 # CLI: extract from URL or local path (PDF only — DOCX dispatch lives in the Flask route)
 python3 pdf_hybrid_extractor.py <pdf_url_or_path>
@@ -19,14 +25,14 @@ python3 pdf_hybrid_extractor.py <pdf_url_or_path>
 PDF_EXTRACTOR_TOKEN=dev python3 pdf_hybrid_extractor.py --serve --port 5050
 
 # Production (matches Dockerfile)
-gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 4 --worker-class gthread --timeout 480 'pdf_hybrid_extractor:create_app()'
+gunicorn --bind 0.0.0.0:5050 --workers 1 --threads 4 --worker-class gthread --backlog 32 --timeout 480 'pdf_hybrid_extractor:create_app()'
 
 # Docker
 docker build -t pdf-hybrid-extractor . && docker run -p 5050:5050 -e GEMINI_API_KEY=... -e PDF_EXTRACTOR_TOKEN=... pdf-hybrid-extractor
 
 # Tests
-pip install -r requirements-dev.txt
-pytest                          # 101 tests, ~1s
+pip install --require-hashes -r requirements-dev.txt
+pytest                          # 209 tests, ~4s
 pytest tests/test_vision.py -v  # single file
 pytest -k "encrypted or ssrf"   # by name pattern
 ```
