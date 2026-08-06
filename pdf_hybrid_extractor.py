@@ -83,6 +83,11 @@ VISION_PARALLEL = int(os.getenv("VISION_PARALLEL", "3"))
 # caminho feliz, então teto curto (25-30s) cortaria justamente as páginas densas
 # — os laudos que interessam. Fica folgado; quem governa o total é o deadline.
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "45"))
+# Teto de saída por página. Transcrição de laudo denso + seção de análise é saída
+# longa; se estourar, o modelo corta NO MEIO — e um valor laboratorial cortado é
+# pior que valor ausente, porque parece completo. Explícito pra não depender do
+# default do modelo, que muda quando o alias troca.
+VISION_MAX_OUTPUT_TOKENS = int(os.getenv("VISION_MAX_OUTPUT_TOKENS", "8192"))
 # Orçamento total da requisição. Derivado do TIMEOUT DO CHAMADOR (webhook desiste
 # em 120s), não do gunicorn — que com gthread não limita request nenhuma. Passar
 # disso é trabalho garantidamente descartado ocupando thread viva.
@@ -396,6 +401,56 @@ def extract_text_docx(docx_bytes: bytes) -> str:
     return mammoth.extract_raw_text(io.BytesIO(docx_bytes)).value
 
 
+def _inspect_response(response) -> tuple[str, str | None]:
+    """Extrai (texto, motivo) de uma resposta do Gemini.
+
+    Resposta vazia era sempre logada como "provável safety filter" — mas vazio
+    tem causas diferentes, com tratamentos diferentes: safety (não adianta
+    repetir), MAX_TOKENS (a saída não coube e provavelmente está CORTADA),
+    recitation, ou candidato sem parte textual. Tratar tudo igual escondia o
+    caso mais perigoso: texto truncado no meio de um valor laboratorial, que
+    volta parecendo completo.
+
+    Tolerante a resposta sem os campos — o formato varia entre versões da SDK e
+    entre modelos, e diagnóstico não pode derrubar extração."""
+    try:
+        text = response.text or ""
+    except Exception:
+        text = ""
+
+    finish = None
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            raw_finish = getattr(candidates[0], "finish_reason", None)
+            if raw_finish is not None:
+                finish = getattr(raw_finish, "name", None) or str(raw_finish)
+                finish = finish.upper()
+    except Exception:
+        finish = None
+
+    block = None
+    try:
+        feedback = getattr(response, "prompt_feedback", None)
+        raw_block = getattr(feedback, "block_reason", None) if feedback else None
+        if raw_block is not None:
+            block = getattr(raw_block, "name", None) or str(raw_block)
+    except Exception:
+        block = None
+
+    if block:
+        return text, f"prompt_bloqueado:{block}"
+    if finish and "MAX_TOKENS" in finish:
+        # Com texto: veio cortado (pior que vazio — parece completo).
+        # Sem texto: o raciocínio do modelo consumiu todo o orçamento de saída.
+        return text, "truncado_max_tokens"
+    if not text:
+        if finish and finish not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+            return "", f"vazio:{finish.lower()}"
+        return "", "vazio:sem_motivo_declarado"
+    return text, None
+
+
 def _remaining(deadline: float | None) -> float:
     """Segundos restantes do orçamento da requisição (infinito se não há prazo)."""
     if deadline is None:
@@ -404,7 +459,8 @@ def _remaining(deadline: float | None) -> float:
 
 
 def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
-                              deadline: float | None = None) -> str | None:
+                              deadline: float | None = None,
+                              diagnostics: dict | None = None) -> str | None:
     """Envia imagem para Gemini Vision com cascata primário→fallback CONDICIONAL
     ao orçamento restante.
 
@@ -414,7 +470,11 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
     estava mais apertado, roubando o prazo das páginas seguintes.
 
     O timeout de cada chamada também é apertado para o que resta do orçamento —
-    nenhuma chamada individual pode sobreviver ao prazo da requisição."""
+    nenhuma chamada individual pode sobreviver ao prazo da requisição.
+
+    `diagnostics` (dict opcional) recebe, por página, o motivo de vazio ou
+    truncamento — safety, MAX_TOKENS e recitation pedem tratamentos diferentes e
+    antes eram todos logados como "provável safety filter"."""
     from google.genai import types
     image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
 
@@ -440,15 +500,32 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
                 model=model_name,
                 contents=[_build_vision_prompt(), image_part],
                 config=types.GenerateContentConfig(
-                    http_options=types.HttpOptions(timeout=call_timeout)
+                    http_options=types.HttpOptions(timeout=call_timeout),
+                    max_output_tokens=VISION_MAX_OUTPUT_TOKENS,
                 ),
             )
-            text = response.text
+            text, motivo = _inspect_response(response)
             if text:
                 if idx > 0:
                     logger.info(f"Página {page_num}: fallback {model_name} ok")
+                if diagnostics is not None and motivo != "truncado_max_tokens":
+                    # A tentativa anterior pode ter deixado um motivo registrado.
+                    # Se o fallback deu certo, a página NÃO é problemática — sem
+                    # isso ela apareceria em vision_diagnostics tendo funcionado.
+                    diagnostics.pop(page_num, None)
+                if motivo == "truncado_max_tokens":
+                    # Texto cortado no meio é pior que texto ausente: volta
+                    # parecendo completo, e o corte pode ter comido um valor.
+                    logger.warning(
+                        f"Página {page_num}: {model_name} truncou a saída em "
+                        f"{VISION_MAX_OUTPUT_TOKENS} tokens — texto pode estar cortado"
+                    )
+                    if diagnostics is not None:
+                        diagnostics[page_num] = "truncado_max_tokens"
                 return text
-            msg = f"Página {page_num}: {model_name} retornou vazio (provável safety filter)"
+            if diagnostics is not None:
+                diagnostics[page_num] = motivo or "vazio"
+            msg = f"Página {page_num}: {model_name} devolveu vazio ({motivo})"
             logger.warning(msg if is_last else f"{msg}, tentando fallback")
         except Exception as e:
             if is_last:
@@ -684,6 +761,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         # travar quem já terminou.
         vision_results: dict[int, str | None] = {}
         aborted_pages: set[int] = set()   # prazo estourado ou chamador sumiu
+        vision_diagnostics: dict[int, str] = {}
         cancelled = False
         if to_vision_capped:
             client = setup_gemini()
@@ -712,7 +790,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
                         continue
 
                     fut = ex.submit(analyze_image_with_vision, client, img_bytes, pn,
-                                    deadline=deadline)
+                                    deadline=deadline, diagnostics=vision_diagnostics)
                     # Libera a vaga assim que a imagem sai de cena — inclusive em
                     # exceção, senão o semáforo seca e o loop trava pra sempre.
                     fut.add_done_callback(lambda _f: images_inflight.release())
@@ -832,8 +910,14 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
         # desistência do chamador ou truncamento de texto. Antes a resposta
         # vinha `success: true` mesmo com páginas descartadas, e um prontuário
         # incompleto era gravado sem ninguém perceber.
+        # Truncamento por MAX_TOKENS conta como incompleto: o texto foi cortado
+        # no meio e volta parecendo inteiro. Mesma razão do resto desta lista.
+        output_truncated = [
+            pn for pn, m in vision_diagnostics.items() if m == "truncado_max_tokens"
+        ]
         complete = not (
-            pages_skipped_vision or aborted_pages or text_truncated or failed_pages
+            pages_skipped_vision or aborted_pages or text_truncated
+            or failed_pages or output_truncated or analysis_unseparated
         )
 
         return {
@@ -853,6 +937,10 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             # persistir isso no prontuário tem que manter a distinção.
             "image_analysis": {str(k): v for k, v in sorted(image_analysis.items())},
             "analysis_unseparated": sorted(analysis_unseparated),
+            # Motivo por página de vazio/truncamento. Safety, MAX_TOKENS e
+            # recitation pedem reações diferentes; antes eram todos "vazio".
+            "vision_diagnostics": {str(k): v for k, v in sorted(vision_diagnostics.items())},
+            "pages_output_truncated": sorted(output_truncated),
             "minio_path": minio_path,
         }
     finally:
@@ -1075,6 +1163,8 @@ def create_app():
                     "text": extract_text_docx(pdf_source),
                     "image_analysis": {},
                     "analysis_unseparated": [],
+                    "vision_diagnostics": {},
+                    "pages_output_truncated": [],
                     "minio_path": None,
                 })
 
