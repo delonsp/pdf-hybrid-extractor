@@ -1,0 +1,46 @@
+[
+  {
+    "modelo": "gemini-3.6-flash",
+    "nivel": "default",
+    "servido": "gemini-3.6-flash",
+    "segundos": 12.6,
+    "tokens_raciocinio": 1212,
+    "tokens_saida": 474,
+    "chars": 975,
+    "motivo": null,
+    "arquivo": "benchmark-vision/gemini-3.6-flash__default.txt"
+  },
+  {
+    "modelo": "gemini-3.6-flash",
+    "nivel": "minimal",
+    "servido": "gemini-3.6-flash",
+    "segundos": 5.1,
+    "tokens_raciocinio": 0,
+    "tokens_saida": 745,
+    "chars": 1959,
+    "motivo": null,
+    "arquivo": "benchmark-vision/gemini-3.6-flash__minimal.txt"
+  },
+  {
+    "modelo": "gemini-3.6-flash",
+    "nivel": "low",
+    "servido": "gemini-3.6-flash",
+    "segundos": 6.5,
+    "tokens_raciocinio": 845,
+    "tokens_saida": 474,
+    "chars": 975,
+    "motivo": null,
+    "arquivo": "benchmark-vision/gemini-3.6-flash__low.txt"
+  },
+  {
+    "modelo": "gemini-2.5-flash",
+    "nivel": "default",
+    "servido": "gemini-2.5-flash",
+    "segundos": 10.2,
+    "tokens_raciocinio": 1459,
+    "tokens_saida": 458,
+    "chars": 868,
+    "motivo": null,
+    "arquivo": "benchmark-vision/gemini-2.5-flash__default.txt"
+  }
+]

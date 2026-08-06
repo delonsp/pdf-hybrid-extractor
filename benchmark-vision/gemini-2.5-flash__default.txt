@@ -1,0 +1,31 @@
+LABORATÓRIO EXEMPLO · ANÁLISES CLÍNICAS
+Rua Inventada, 100 · CNPJ 00.000.000/0001-00
+
+Paciente: PACIENTE DE TESTE
+Registro: 000000 Idade: 45 anos Sexo: F
+Coleta: 01/08/2026 07:32 Emissão: 02/08/2026 14:10
+
+HEMOGRAMA COMPLETO
+Exame Resultado Unidade Referência
+Hemoglobina 13,2 g/dL 12,0 - 15,5
+Hematócrito 39,8 % 36,0 - 46,0
+Leucócitos 6.400 /mm³ 4.000 - 11.000
+Plaquetas 254.000 /mm³ 150.000 - 450.000
+VCM 88,4 fL 80,0 - 100,0
+
+BIOQUÍMICA
+Cortisol basal 12,4 µg/dL 6,2 - 19,4
+TSH 2,31 µUI/mL 0,45 - 4,50
+Vitamina D (25-OH) 28 ng/mL 30 - 100
+Ferritina 45 ng/mL 15 - 150
+
+DENSITOMETRIA · T-score coluna: -2,1 DP Fêmur: -1,8 DP
+Observações: Vitamina D abaixo do valor de referência.
+Área de superfície corporal estimada: 1,73 m²
+
+Evolução de vitamina D (últimos 4 exames)
+
+Dr. Responsável · CRM 00000 Assinado eletronicamente
+
+===ANALISE_DA_IMAGEM===
+sem imagem de exame

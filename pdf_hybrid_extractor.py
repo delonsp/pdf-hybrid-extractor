@@ -114,10 +114,14 @@ RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "30"))
 # seja, um balde só para todo mundo.
 PROXY_FIX_HOPS = int(os.getenv("PROXY_FIX_HOPS", "1"))
 ABORT_ON_CLIENT_DISCONNECT = os.getenv("ABORT_ON_CLIENT_DISCONNECT", "true").lower() == "true"
-# Primário: alias dinâmico (hoje aponta pro flash mais novo, podendo ser preview/3.x).
-# Fallback: pinned em 2.5-flash (estável). Cascata é per-page — falha pontual no
-# primário não derruba o PDF inteiro.
-VISION_MODEL = os.getenv("VISION_MODEL", "gemini-flash-latest")
+# Primário PINADO (C1). Em 06/08/2026, `gemini-flash-latest` resolvia para
+# gemini-3.6-flash — verificado com --check-models. Pinar aqui não muda o
+# comportamento de hoje, congela ele: o prompt de transcrição e o teto de tokens
+# foram calibrados contra este modelo, e o alias trocaria os três de uma vez,
+# sem deploy e sem aviso. Para atualizar: rodar --check-models e --benchmark.
+# Fallback: 2.5-flash (estável). Cascata é per-page — falha pontual no primário
+# não derruba o PDF inteiro.
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.6-flash")
 VISION_MODEL_FALLBACK = os.getenv("VISION_MODEL_FALLBACK", "gemini-2.5-flash")
 # Nível de raciocínio. NÃO setado por padrão de propósito: baixar o thinking no
 # escuro pode piorar o OCR, que é justamente o que não se quer perder. Medir com
@@ -538,6 +542,16 @@ def _log_model_version(requested: str, response) -> None:
 
 VALID_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
 _thinking_warned: set[str] = set()
+# Modelos que rejeitam thinking_level. Descoberto em runtime, não hardcoded: a
+# lista muda com o catálogo. Medido em 06/08/2026 — gemini-2.5-flash devolve
+# 400 INVALID_ARGUMENT "Thinking level is not supported for this model".
+# Sem isto, setar VISION_THINKING_LEVEL mataria TODA chamada ao fallback com um
+# erro não-retentável: a rede de segurança sumiria justo quando o primário falha.
+_models_sem_thinking: set[str] = set()
+
+
+def _nao_suporta_thinking(exc) -> bool:
+    return "thinking level is not supported" in str(exc).lower()
 
 
 def _thinking_config(types):
@@ -627,7 +641,8 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
                 http_options=types.HttpOptions(
                     timeout=int(min(GEMINI_TIMEOUT, max(_remaining(deadline), 1)) * 1000)),
                 max_output_tokens=VISION_MAX_OUTPUT_TOKENS,
-                thinking_config=_thinking_config(types),
+                thinking_config=(None if model_name in _models_sem_thinking
+                                 else _thinking_config(types)),
             ),
         )
         _log_model_version(model_name, response)
@@ -679,6 +694,15 @@ def analyze_image_with_vision(client, image_bytes: bytes, page_num: int,
                 logger.warning(msg if is_last else f"{msg}, tentando fallback")
                 break  # vazio não é transitório: vai pro próximo modelo
             except Exception as e:
+                if _nao_suporta_thinking(e) and model_name not in _models_sem_thinking:
+                    # Modelo não aceita thinking_level: anota e repete JÁ, sem
+                    # espera — não é falha transitória, é config incompatível.
+                    _models_sem_thinking.add(model_name)
+                    logger.warning(
+                        f"'{model_name}' não aceita thinking_level — repetindo "
+                        f"sem ele (e sem enviar mais para este modelo)"
+                    )
+                    continue
                 espera = _retry_delay(e, estado["tentativas"])
                 if espera is None:
                     if is_last:

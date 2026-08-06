@@ -107,3 +107,51 @@ class TestThinkingConfig:
         fake = fake_gemini_client({PRIMARY: "ok"})
         pdfx.analyze_image_with_vision(fake, b"img", 1)
         assert fake.configs[0].thinking_config.thinking_level == "MINIMAL"
+
+
+class TestModeloSemThinking:
+    """Medido em 06/08/2026: gemini-2.5-flash devolve 400 INVALID_ARGUMENT para
+    thinking_level. Como 400 não é retentável, setar VISION_THINKING_LEVEL
+    mataria TODA chamada ao fallback — a rede de segurança sumiria justamente
+    quando o primário está falhando."""
+
+    @pytest.fixture(autouse=True)
+    def _limpa(self):
+        pdfx._models_sem_thinking.clear()
+        yield
+        pdfx._models_sem_thinking.clear()
+
+    def test_detecta_a_mensagem_do_google(self):
+        e = Exception("400 INVALID_ARGUMENT. {'error': {'message': "
+                      "'Thinking level is not supported for this model.'}}")
+        assert pdfx._nao_suporta_thinking(e)
+        assert not pdfx._nao_suporta_thinking(Exception("429 quota"))
+
+    def test_repete_sem_thinking_e_salva_a_pagina(self, mocker, fake_gemini_client,
+                                                  monkeypatch):
+        monkeypatch.setattr(pdfx, "VISION_THINKING_LEVEL", "minimal")
+        # primeira chamada falha por thinking; a segunda (sem thinking) devolve OK
+        estado = {"n": 0}
+
+        def comportamento(m, c):
+            estado["n"] += 1
+            if estado["n"] == 1:
+                raise Exception("400 Thinking level is not supported for this model.")
+            from conftest import FakeGeminiResponse
+            return FakeGeminiResponse("transcrição salva")
+
+        fake = fake_gemini_client({pdfx.VISION_MODEL: comportamento})
+        out = pdfx.analyze_image_with_vision(fake, b"img", 1)
+        assert out == "transcrição salva"
+        assert pdfx.VISION_MODEL in pdfx._models_sem_thinking
+        # a segunda chamada foi feita SEM thinking_config
+        assert fake.configs[0].thinking_config is not None
+        assert fake.configs[1].thinking_config is None
+
+    def test_nao_manda_thinking_de_novo_pro_mesmo_modelo(self, mocker, fake_gemini_client,
+                                                         monkeypatch):
+        monkeypatch.setattr(pdfx, "VISION_THINKING_LEVEL", "minimal")
+        pdfx._models_sem_thinking.add(pdfx.VISION_MODEL)
+        fake = fake_gemini_client({pdfx.VISION_MODEL: "ok"})
+        pdfx.analyze_image_with_vision(fake, b"img", 1)
+        assert fake.configs[0].thinking_config is None

@@ -1,0 +1,45 @@
+**LABORATÓRIO EXEMPLO · ANÁLISES CLÍNICAS**
+Rua Inventada, 100 · CNPJ 00.000.000/0001-00
+
+---
+
+**Paciente: PACIENTE DE TESTE**
+Registro: 000000    Idade: 45 anos    Sexo: F
+Coleta: 01/08/2026 07:32    Emissão: 02/08/2026 14:10
+
+---
+
+### **HEMOGRAMA COMPLETO**
+
+| Exame | Resultado | Unidade | Referência |
+| :--- | :--- | :--- | :--- |
+| Hemoglobina | 13,2 | g/dL | 12,0 - 15,5 |
+| Hematócrito | 39,8 | % | 36,0 - 46,0 |
+| Leucócitos | 6.400 | /mm³ | 4.000 - 11.000 |
+| Plaquetas | 254.000 | /mm³ | 150.000 - 450.000 |
+| VCM | 88,4 | fL | 80,0 - 100,0 |
+
+### **BIOQUÍMICA**
+
+| Exame | Resultado | Unidade | Referência |
+| :--- | :--- | :--- | :--- |
+| Cortisol basal | 12,4 | µg/dL | 6,2 - 19,4 |
+| TSH | 2,31 | µUI/mL | 0,45 - 4,50 |
+| Vitamina D (25-OH) | 28 | ng/mL | 30 - 100 |
+| Ferritina | 45 | ng/mL | 15 - 150 |
+
+DENSITOMETRIA · T-score coluna: -2,1 DP    Fêmur: -1,8 DP
+
+Observações: Vitamina D abaixo do valor de referência.
+Área de superfície corporal estimada: 1,73 m²
+
+[imagem de exame]
+Evolução de vitamina D (últimos 4 exames)
+
+Dr. Responsável · CRM 00000    Assinado eletronicamente
+
+===ANALISE_DA_IMAGEM===
+
+Visível: Gráfico de barras simples com quatro colunas azuis em fundo branco com contorno preto, representando ordinalmente a "Evolução de vitamina D (últimos 4 exames)". A primeira barra é a mais alta, a segunda e a terceira apresentam queda progressiva na altura, e a quarta apresenta uma elevação intermediária. Não há eixos graduados, valores numéricos explicitados nas colunas ou datas específicas registradas diretamente no gráfico.
+
+Hipóteses: Os achados gráficos ilustram uma flutuação nos níveis séricos de vitamina D ao longo do tempo, mostrando uma redução nos exames intermediários seguida por uma parcial recuperação no último registro. Não é possível levantar diagnósticos com segurança apenas a partir do gráfico esquemático, devendo ser correlacionado com a clínica e os valores laboratoriais pontuais citados no laudo.

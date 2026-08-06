@@ -381,8 +381,17 @@ allowlist) e A8 (config de infra).
 
 ### Lote C — Modelo, dependências, API (P1/P2)
 
-- [~] C1. Pinar `VISION_MODEL` em ID explícito (fim do alias). **Ferramenta pronta, valor pendente:** o catálogo de modelos depende do projeto/billing, então o ID certo não dá pra escolher de fora. `--check-models` lista os modelos do projeto e resolve o alias em um comando. Enquanto não for pinado, todo call loga qual modelo atendeu de fato, e uma troca de alias vira WARNING — o evento fica visível em vez de silencioso
-- [~] C2. Medir thinking numa amostra anonimizada e **só então** fixar o nível. **Harness pronto:** `--benchmark <pdf>` roda modelos × níveis numa página real, reporta tokens de raciocínio, tempo e tamanho, e grava cada transcrição em `benchmark-vision/` para comparação. `VISION_THINKING_LEVEL` segue **não setado** de propósito — a medição é que decide. Falta rodar com um laudo anonimizado
+- [x] C1. **Pinado em `gemini-3.6-flash`.** Medido em 06/08/2026 com `--check-models` rodando contra a API real: `gemini-flash-latest` resolvia para `gemini-3.6-flash`. Pinar **não muda o comportamento de hoje, congela ele**. (Resolve a divergência registrada em §8: minha leitura da doc estava certa, a da crítica externa — 3.5-flash — não.) Todo call segue logando qual modelo atendeu, e uma troca vira WARNING
+- [x] C2. **Medido em 06/08/2026** com `--benchmark` num laudo sintético (sem dado de paciente), gemini-3.6-flash:
+
+  | nível | tempo | tokens de raciocínio | fidelidade dos valores |
+  |---|---|---|---|
+  | default | 12,6s | 1212 | todos preservados |
+  | low | 6,5s | 845 | todos preservados |
+  | minimal | 5,1s | 0 | todos preservados |
+
+  Todos preservaram os valores, `µg/dL`, `m²` e o T-score negativo. `minimal` é 2,5× mais rápido e sem custo de raciocínio, **mas formata em Markdown** (tabelas, negrito), o que muda a forma do texto a jusante. **`VISION_THINKING_LEVEL` segue não setado:** o teste foi um laudo digital limpo, e o caso em que raciocínio deve pesar é a foto torta de laudo amassado, que este benchmark não representa. Repetir com um scan real antes de mexer
+- [x] C2b. **Bug encontrado pela medição, não pelos testes:** `gemini-2.5-flash` devolve `400 INVALID_ARGUMENT` para `thinking_level`. Como 400 não é retentável, setar `VISION_THINKING_LEVEL` mataria **toda** chamada ao fallback — a rede de segurança sumiria justamente quando o primário falha. Agora o modelo é anotado em runtime e a chamada é repetida sem thinking; verificado contra a API real
 - [x] C3. Retry **depois** do deadline existir (B3): respeitar `Retry-After`, orçamento total de tentativas somando primário + fallback. *(Nota: verifiquei em `_api_client.py:531` que `retry_args(None)` devolve `stop_after_attempt(1)` — a SDK **não** repete sozinha. `MAX_RETRY_COUNT=3` só vale para upload de arquivo.)*
 - [x] C4. Lock completo: versões exatas **com transitivas e hashes**, e imagem Docker pinada por **digest** — ⚠ pinar só os diretos não torna o build reprodutível
 - [x] C5. Congelar o conjunto atual primeiro; upgrades (PyMuPDF 1.28, google-genai 2.16, flask 3.1.3, flask-limiter 4.x, gunicorn 26.x) em **PR separado**, um por vez
