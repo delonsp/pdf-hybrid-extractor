@@ -152,6 +152,11 @@ MAX_OUTPUT_CHARS = int(os.getenv("MAX_OUTPUT_CHARS", str(5_000_000)))
 # contra descompressão abusiva — um .docx de poucos MB vira GB dentro do mammoth.
 MAX_DOCX_UNCOMPRESSED = int(os.getenv("MAX_DOCX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
 MAX_ZIP_ENTRIES = int(os.getenv("MAX_ZIP_ENTRIES", "2000"))
+# Prefixo do objeto no Minio: "telefone" (atual) ou "pseudonimo" (HMAC com sal).
+# Default no atual de propósito — virar pseudônimo muda o layout do bucket e
+# quebra busca por prefixo nos objetos já gravados. É decisão de migração.
+MINIO_KEY_MODE = os.getenv("MINIO_KEY_MODE", "telefone").lower()
+MINIO_KEY_SALT = os.getenv("MINIO_KEY_SALT", "")
 MAX_COMPRESSION_RATIO = float(os.getenv("MAX_COMPRESSION_RATIO", "200"))
 ALLOWED_DOWNLOAD_TYPES = {
     "application/pdf",
@@ -696,15 +701,19 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
     else:
         pdf_bytes = Path(pdf_source).read_bytes()
 
-    # Salva no Minio se configurado
-    minio_path = None
-    if save_to_minio and telefone and minio_config:
-        minio_path = save_to_minio_storage(pdf_bytes, telefone, minio_config)
-
     # Abertura defensiva: PDFs inválidos/criptografados viram ValueError → 400
     # com mensagem útil em vez do "internal error" genérico do handler de 500.
     doc = _open_pdf(pdf_bytes)
     page_count = doc.page_count
+
+    # Minio DEPOIS da validação: antes, um arquivo corrompido era gravado e só
+    # então o open falhava, deixando lixo no bucket. Continua sendo salvo mesmo
+    # se a extração falhar adiante — aí o original é justamente o que se quer ter.
+    minio_path = None
+    minio_error = None
+    minio_requested = bool(save_to_minio and telefone and minio_config)
+    if minio_requested:
+        minio_path, minio_error = save_to_minio_storage(pdf_bytes, telefone, minio_config)
 
     try:
         # Passada 1: classifica cada página em native | vision | hybrid (sem renderizar)
@@ -942,18 +951,53 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             "vision_diagnostics": {str(k): v for k, v in sorted(vision_diagnostics.items())},
             "pages_output_truncated": sorted(output_truncated),
             "minio_path": minio_path,
+            # Explícito: quem pediu persistência precisa saber se ela aconteceu.
+            # Antes a falha voltava como success:true + minio_path:null.
+            "minio_stored": bool(minio_path) if minio_requested else None,
+            "minio_error": minio_error,
         }
     finally:
         _close_pdf(doc)
 
 
-def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str | None:
-    """Salva PDF no Minio. Object name usa timestamp UTC + sufixo UUID curto
-    (evita colisão quando duas requests do mesmo telefone caem no mesmo
-    segundo)."""
+def _minio_prefix(telefone: str) -> str:
+    """Prefixo do objeto: telefone cru ou pseudônimo estável.
+
+    O telefone na chave expõe identificador pessoal em listagem de bucket, em
+    métrica e no `minio_path` que volta pro chamador — mascarar o log não
+    resolvia isso. O pseudônimo é HMAC-SHA256 com sal secreto: estável (o mesmo
+    paciente cai sempre no mesmo prefixo, então continua dando pra agrupar) e
+    não reversível. Sem sal, HMAC de telefone é força-bruta trivial: o espaço de
+    telefones é pequeno demais.
+
+    Default é `telefone` de propósito — virar pseudônimo muda o layout do bucket
+    e quebra qualquer busca por prefixo de telefone nos objetos JÁ gravados.
+    Isso é decisão de migração, não de código."""
+    if MINIO_KEY_MODE != "pseudonimo":
+        return telefone
+    if not MINIO_KEY_SALT:
+        raise ValueError(
+            "MINIO_KEY_MODE=pseudonimo exige MINIO_KEY_SALT "
+            "(sem sal, o HMAC de um telefone é quebrado por força bruta)"
+        )
+    import hashlib
+    digest = hmac.new(MINIO_KEY_SALT.encode(), telefone.encode(), hashlib.sha256)
+    return digest.hexdigest()[:32]
+
+
+def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> tuple[str | None, str | None]:
+    """Salva PDF no Minio. Devolve (caminho, erro) — nunca engole a falha.
+
+    Antes retornava None em erro e o endpoint respondia `success: true` com
+    `minio_path: null`: quem pediu persistência não tinha como saber que ela não
+    aconteceu. Agora o motivo sobe para o chamador.
+
+    Object name usa timestamp UTC + sufixo UUID curto (evita colisão quando duas
+    requests do mesmo paciente caem no mesmo segundo)."""
     try:
         import uuid
         from minio import Minio
+        from minio.error import S3Error
         from datetime import datetime, timezone
 
         client = Minio(
@@ -966,10 +1010,16 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str 
         bucket = config.get("bucket", "pacientes")
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         suffix = uuid.uuid4().hex[:8]
-        object_name = f"{telefone}/{timestamp}_{suffix}.pdf"
+        object_name = f"{_minio_prefix(telefone)}/{timestamp}_{suffix}.pdf"
 
         if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
+            try:
+                client.make_bucket(bucket)
+            except S3Error as e:
+                # Corrida: duas requests viram o bucket faltando ao mesmo tempo
+                # e ambas tentaram criar. Perder essa corrida não é erro.
+                if e.code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                    raise
 
         client.put_object(
             bucket,
@@ -979,10 +1029,11 @@ def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str 
             content_type="application/pdf"
         )
 
-        return f"{bucket}/{object_name}"
-    except Exception:
+        return f"{bucket}/{object_name}", None
+    except Exception as e:
+        # Log sem o caminho (que pode conter telefone) — só o tipo do erro.
         logger.exception("Erro ao salvar no Minio")
-        return None
+        return None, f"{type(e).__name__}: {e}"
 
 
 # === Modo Servidor Flask ===
@@ -1165,6 +1216,8 @@ def create_app():
                     "analysis_unseparated": [],
                     "vision_diagnostics": {},
                     "pages_output_truncated": [],
+                    "minio_stored": None,
+                    "minio_error": None,
                     "minio_path": None,
                 })
 
