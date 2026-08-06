@@ -30,7 +30,7 @@ import threading
 import requests
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -428,36 +428,101 @@ def _page_image_coverage(page) -> float:
     return min(total / page_area, 1.0)
 
 
-def _render_page_png(page) -> bytes:
+# Lock global do PyMuPDF. NÃO é por requisição — é do processo inteiro.
+#
+# A documentação do PyMuPDF diz que multiprocessing é suportado e multithreading
+# NÃO é. O modo de falha não é exceção (que cairia em failed_pages): é pixmap
+# corrompido — imagem lixo que o Gemini "lê" e vira texto inventado no prontuário
+# — ou queda do interpretador, que com 1 worker leva junto as 4 requisições em voo.
+#
+# O antigo doc_lock era criado dentro de process_pdf, então valia só dentro de uma
+# requisição; as 4 threads do gunicorn usavam o MuPDF simultaneamente com locks
+# que não se enxergavam. Este lock serializa TODA chamada ao PyMuPDF do processo.
+#
+# Custo: render leva 50-200ms e a chamada ao Gemini 4-30s. Serializar o render
+# entre 4 threads adiciona menos de 1s no pior caso, contra p50 de 4,5s por
+# documento — ruído. Era risco de corrupção em troca de milissegundos.
+#
+# Regra ao mexer aqui: NENHUM objeto do PyMuPDF (Document, Page, Pixmap) pode ser
+# tocado fora deste lock. As funções abaixo entram, fazem a operação inteira e
+# devolvem dado puro (bytes, str, float).
+_pymupdf_lock = threading.RLock()
+
+
+def _open_pdf(pdf_bytes: bytes):
+    """Abre o documento. PDFs inválidos/criptografados viram ValueError → 400."""
+    with _pymupdf_lock:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as e:
+            raise ValueError(f"PDF inválido ou corrompido: {e}") from e
+        if doc.is_encrypted and not doc.authenticate(""):
+            doc.close()
+            raise ValueError("PDF está criptografado/protegido por senha")
+        if doc.page_count > MAX_TOTAL_PAGES:
+            page_count = doc.page_count
+            doc.close()
+            raise ValueError(f"PDF com páginas demais: {page_count} > cap {MAX_TOTAL_PAGES}")
+        return doc
+
+
+def _close_pdf(doc) -> None:
+    with _pymupdf_lock:
+        doc.close()
+
+
+def _classify_page(doc, index: int) -> tuple[str, float, bool]:
+    """Texto, cobertura de imagem e flag de falha de UMA página.
+
+    Lock por página, não pela passada inteira: um PDF de 500 páginas bloquearia
+    as outras requisições por segundos se o lock fosse pego uma vez só."""
+    with _pymupdf_lock:
+        page = doc[index]
+        try:
+            text = page.get_text().strip()
+            failed = False
+        except Exception:
+            logger.exception(f"Página {index + 1}: falha ao extrair texto nativo")
+            text = ""
+            failed = True
+        coverage = _page_image_coverage(page)
+    return text, coverage, failed
+
+
+def _render_page_png(doc, index: int) -> bytes:
     """Rasteriza a página em PNG respeitando MAX_RENDER_PIXELS.
 
     Uma página com MediaBox gigante faria o get_pixmap alocar centenas de MB a GB
     — o cap de bytes do download não protege disso, porque o PDF em si pode ter
     poucos KB. Aqui o zoom é reduzido até caber no teto; se para caber ele tiver
     que ficar abaixo de MIN_RENDER_ZOOM, a página é recusada como falha isolada
-    (render ilegível não vale a chamada ao Gemini) em vez de derrubar o processo."""
-    rect = page.rect
-    width, height = abs(rect.width), abs(rect.height)
-    if not width or not height:
-        raise ValueError("página com dimensão zero")
+    (render ilegível não vale a chamada ao Gemini) em vez de derrubar o processo.
 
-    zoom = VISION_ZOOM
-    if width * height * zoom * zoom > MAX_RENDER_PIXELS:
-        zoom = math.sqrt(MAX_RENDER_PIXELS / (width * height))
-        # Abaixo de um piso o render sai ilegível e a chamada ao Gemini seria
-        # gasto sem retorno — melhor falhar a página do que mandar borrão.
-        if zoom < MIN_RENDER_ZOOM:
-            raise ValueError(
-                f"página grande demais para rasterizar de forma legível "
-                f"({width:.0f}x{height:.0f}pt, zoom cairia para {zoom:.3f})"
+    Roda sob _pymupdf_lock e devolve bytes — nenhum objeto do PyMuPDF escapa."""
+    with _pymupdf_lock:
+        page = doc[index]
+        rect = page.rect
+        width, height = abs(rect.width), abs(rect.height)
+        if not width or not height:
+            raise ValueError("página com dimensão zero")
+
+        zoom = VISION_ZOOM
+        if width * height * zoom * zoom > MAX_RENDER_PIXELS:
+            zoom = math.sqrt(MAX_RENDER_PIXELS / (width * height))
+            # Abaixo de um piso o render sai ilegível e a chamada ao Gemini seria
+            # gasto sem retorno — melhor falhar a página do que mandar borrão.
+            if zoom < MIN_RENDER_ZOOM:
+                raise ValueError(
+                    f"página grande demais para rasterizar de forma legível "
+                    f"({width:.0f}x{height:.0f}pt, zoom cairia para {zoom:.3f})"
+                )
+            logger.warning(
+                f"Página {index + 1}: {width:.0f}x{height:.0f}pt excede "
+                f"MAX_RENDER_PIXELS, zoom reduzido para {zoom:.2f}"
             )
-        logger.warning(
-            f"Página {page.number + 1}: {width:.0f}x{height:.0f}pt excede "
-            f"MAX_RENDER_PIXELS, zoom reduzido para {zoom:.2f}"
-        )
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-    return pix.tobytes("png")
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        return pix.tobytes("png")
 
 
 def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
@@ -502,43 +567,21 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
 
     # Abertura defensiva: PDFs inválidos/criptografados viram ValueError → 400
     # com mensagem útil em vez do "internal error" genérico do handler de 500.
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        raise ValueError(f"PDF inválido ou corrompido: {e}") from e
-
-    if doc.is_encrypted and not doc.authenticate(""):
-        doc.close()
-        raise ValueError("PDF está criptografado/protegido por senha")
-
-    # Cap de páginas: um PDF de poucos KB pode declarar milhares de páginas, e a
-    # passada 1 roda get_text() em todas antes de qualquer outro limite valer.
-    if doc.page_count > MAX_TOTAL_PAGES:
-        page_count = doc.page_count
-        doc.close()
-        raise ValueError(f"PDF com páginas demais: {page_count} > cap {MAX_TOTAL_PAGES}")
-
-    # Lock pra render do PyMuPDF: MuPDF NÃO é thread-safe num mesmo Document.
-    # Render é rápido (~50-200ms); a chamada Gemini lenta (5-30s) continua
-    # paralela. Sem isso há risco de pixmap corrompido / segfault sob carga.
-    doc_lock = threading.Lock()
+    doc = _open_pdf(pdf_bytes)
+    page_count = doc.page_count
 
     try:
         # Passada 1: classifica cada página em native | vision | hybrid (sem renderizar)
         page_metas = []
         classify_failed = []
-        for i, page in enumerate(doc):
+        for i in range(page_count):
             # get_text() também estoura em página corrompida (JBIG2/JPX quebrado,
             # xref inconsistente). Sem esta guarda, a passada 1 inteira morria e
             # o documento todo virava 500 — inclusive as páginas boas.
-            try:
-                text = page.get_text().strip()
-            except Exception:
-                logger.exception(f"Página {i + 1}: falha ao extrair texto nativo")
+            text, img_coverage, failed = _classify_page(doc, i)
+            if failed:
                 classify_failed.append(i + 1)
-                text = ""
             has_text = len(text) >= MIN_TEXT_THRESHOLD
-            img_coverage = _page_image_coverage(page)
             has_significant_image = img_coverage >= IMAGE_COVERAGE_THRESHOLD
 
             if not has_text:
@@ -568,43 +611,61 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             f"{len(to_vision_capped)} processadas, {len(skipped_set)} ignoradas pelo cap"
         )
 
-        # Passada 2: render lazy + Vision em paralelo, dentro do orçamento
+        # Passada 2: RENDER NO FLUXO PRINCIPAL, só o HTTP do Gemini em paralelo.
+        #
+        # Antes o render rodava dentro do ThreadPoolExecutor — PyMuPDF em threads,
+        # o que a doc dele desaconselha e falha em silêncio (pixmap corrompido ou
+        # queda do interpretador). O paralelismo ali não comprava nada: render é
+        # 50-200ms contra 4-30s da chamada ao Gemini. Agora o pool só carrega a
+        # espera de rede, que é o que de fato se beneficia.
+        #
+        # Pipeline contínuo (não em ondas): com p99 de 85s, esperar cada onda
+        # fechar faria uma página lenta segurar duas rápidas. O semáforo limita
+        # quantas imagens ficam vivas ao mesmo tempo, dando contrapressão sem
+        # travar quem já terminou.
         vision_results: dict[int, str | None] = {}
-        aborted_pages: set[int] = set()   # prazo estourado
+        aborted_pages: set[int] = set()   # prazo estourado ou chamador sumiu
         cancelled = False
         if to_vision_capped:
             client = setup_gemini()
-
-            def _vision_one(meta):
-                # try/except cobrindo o RENDER, não só a chamada ao Gemini:
-                # analyze_image_with_vision engole as próprias exceções, mas uma
-                # falha no get_pixmap escapava, o ex.map re-levantava e o PDF
-                # inteiro virava 500 — jogando fora as páginas já extraídas.
-                pn = meta["page_num"]
-                # Checagem antes de gastar qualquer coisa nesta página: o
-                # ThreadPoolExecutor já despachou a fila inteira, então páginas
-                # que só começariam depois do prazo desistem aqui, de graça.
-                if is_cancelled is not None and is_cancelled():
-                    return pn, None, "cancelled"
-                if _remaining(deadline) <= max(VISION_START_MIN_BUDGET, 0):
-                    return pn, None, "deadline"
-                try:
-                    with doc_lock:
-                        img_bytes = _render_page_png(doc[pn - 1])
-                except Exception:
-                    logger.exception(f"Página {pn}: falha ao rasterizar")
-                    return pn, None, "failed"
-                text = analyze_image_with_vision(client, img_bytes, pn, deadline=deadline)
-                return pn, text, None if text else "failed"
+            images_inflight = threading.Semaphore(VISION_PARALLEL + 1)
+            futures = {}
 
             with ThreadPoolExecutor(max_workers=VISION_PARALLEL) as ex:
-                for pn, text, reason in ex.map(_vision_one, to_vision_capped):
-                    vision_results[pn] = text
-                    if reason == "deadline":
-                        aborted_pages.add(pn)
-                    elif reason == "cancelled":
-                        aborted_pages.add(pn)
+                for meta in to_vision_capped:
+                    pn = meta["page_num"]
+                    # Checado no fluxo principal, antes de gastar render ou cota:
+                    # páginas que só começariam fora do prazo desistem de graça.
+                    if not cancelled and is_cancelled is not None and is_cancelled():
                         cancelled = True
+                    if cancelled or _remaining(deadline) <= max(VISION_START_MIN_BUDGET, 0):
+                        aborted_pages.add(pn)
+                        vision_results[pn] = None
+                        continue
+
+                    images_inflight.acquire()
+                    try:
+                        img_bytes = _render_page_png(doc, pn - 1)
+                    except Exception:
+                        logger.exception(f"Página {pn}: falha ao rasterizar")
+                        images_inflight.release()
+                        vision_results[pn] = None
+                        continue
+
+                    fut = ex.submit(analyze_image_with_vision, client, img_bytes, pn,
+                                    deadline=deadline)
+                    # Libera a vaga assim que a imagem sai de cena — inclusive em
+                    # exceção, senão o semáforo seca e o loop trava pra sempre.
+                    fut.add_done_callback(lambda _f: images_inflight.release())
+                    futures[fut] = pn
+
+                for fut in as_completed(futures):
+                    pn = futures[fut]
+                    try:
+                        vision_results[pn] = fut.result()
+                    except Exception:
+                        logger.exception(f"Página {pn}: falha inesperada no Vision")
+                        vision_results[pn] = None
 
             if cancelled:
                 logger.warning(
@@ -712,7 +773,7 @@ def process_pdf(pdf_source: str | bytes, save_to_minio: bool = False,
             "minio_path": minio_path,
         }
     finally:
-        doc.close()
+        _close_pdf(doc)
 
 
 def save_to_minio_storage(pdf_bytes: bytes, telefone: str, config: dict) -> str | None:

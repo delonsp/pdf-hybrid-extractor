@@ -24,7 +24,7 @@ class TestRenderPixelCap:
         doc.new_page(width=2000, height=2000)  # 16 MP no zoom padrão (2x)
         monkeypatch.setattr(pdfx, "MAX_RENDER_PIXELS", 4_000_000)
         try:
-            png = pdfx._render_page_png(doc[0])
+            png = pdfx._render_page_png(doc, 0)
             # zoom cai de 2.0 para 1.0 → 2000x2000 px, dentro do teto
             pix = fitz.Pixmap(png)
             assert (pix.width, pix.height) == (2000, 2000)
@@ -41,14 +41,14 @@ class TestRenderPixelCap:
         monkeypatch.setattr(pdfx, "MAX_RENDER_PIXELS", 10_000)  # zoom ~0.02
         with pytest.raises(ValueError, match="legível"):
             try:
-                pdfx._render_page_png(doc[0])
+                pdfx._render_page_png(doc, 0)
             finally:
                 doc.close()
 
     def test_normal_page_uses_configured_zoom(self):
         doc = fitz.open()
-        page = doc.new_page(width=595, height=842)  # A4
-        png = pdfx._render_page_png(page)
+        doc.new_page(width=595, height=842)  # A4
+        png = pdfx._render_page_png(doc, 0)
         doc.close()
         assert png.startswith(b"\x89PNG")
 
